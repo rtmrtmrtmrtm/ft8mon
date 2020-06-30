@@ -1,2 +1,6 @@
 # ft8mon
-FT8 receiver in C++
+Receive code for the FT8 protocol of Taylor and Franke,
+written in C++.
+
+Robert Morris
+AB1HL
