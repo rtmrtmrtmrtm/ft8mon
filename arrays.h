@@ -1,9 +1,11 @@
+//
 // this is the LDPC(174,91) parity check matrix.
 // each row describes one parity check.
 // 83 rows.
 // each number is an index into the codeword (1-origin).
 // the codeword bits mentioned in each row must xor to zero.
 // From WSJT-X's ldpc_174_91_c_reordered_parity.f90
+//
 int Nm[][7] = {
  {  4,  31,  59,  91,  92,  96, 153 },
  {  5,  32,  60,  93, 115, 146,   0 },

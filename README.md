@@ -1,6 +1,7 @@
 # ft8mon
-Receive code for the FT8 protocol of Taylor and Franke,
-written in C++.
+Demodulate the FT8 WSJT-X protocol of Taylor and Franke.
+Input from a sound card via portaudio.
+Written in C++.
 
-Robert Morris
+Robert Morris,
 AB1HL

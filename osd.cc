@@ -1,3 +1,9 @@
+
+//
+// ordered statistics decoder for LDPC and new FT8.
+// idea from wsjt-x.
+//
+
 #include <vector>
 #include <algorithm>
 #include <stdio.h>
@@ -86,8 +92,6 @@ matmul(int a[91][91], int b[91], int c[91])
   }
 }
 
-// ordered statistics decoder for LDPC and new FT8.
-// idea from wsjt-x.
 // codeword[i] = log ( P(x=0) / P(x=1) )
 // codeword has 174 bits.
 // first 91 bits are plaintext, remaining 83 are parity.

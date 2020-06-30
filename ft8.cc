@@ -2,6 +2,9 @@
 //
 // The core of an FT8 decoder in C++.
 //
+// Many ideas and protocol details borrowed from Franke
+// and Taylor's WSJT-X code.
+//
 // Robert Morris, AB1HL
 //
 
@@ -807,49 +810,6 @@ one_ifft(const std::vector<std::complex<double>> &bins)
   return out;
 }
 
-//
-// inverse FFT.
-// outputs are divided by sqrt(n).
-// 
-std::vector<double>
-xxx_one_ifft_c(const std::vector<std::complex<double>> &bins)
-{
-  assert(0);
-  
-  int block = bins.size();
-
-  fftw_complex *m_in = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
-  fftw_complex *m_out = (fftw_complex *) fftw_malloc(block * sizeof(fftw_complex));
-  assert(m_in && m_out);
-
-  fftw_plan m_plan =
-    fftw_plan_dft_1d(block, m_in, m_out, FFTW_BACKWARD, FFTW_ESTIMATE);
-  assert(m_plan);
-
-  for(int bi = 0; bi < block; bi++){
-    double re = bins[bi].real();
-    double im = bins[bi].imag();
-    m_in[bi][0] = re;
-    m_in[bi][1] = im;
-  }
-
-  fftw_execute(m_plan);
-
-  std::vector<double> out(block);
-  double norm = 1.0 / sqrt(block);
-  for(int i = 0; i < block; i++){
-    double re = m_out[i][0];
-    out[i] = re;
-    out[i] *= norm;
-  }
-
-  fftw_destroy_plan(m_plan);
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return out;
-}
-
 std::vector<std::complex<double>>
 one_ifft_cc(const std::vector<std::complex<double>> &bins)
 {
@@ -1627,39 +1587,6 @@ extract_bits(const std::vector<int> &syms)
   return bits;
 }
 
-void
-prepare_hard(const ffts_t &m79, double ll174[])
-{
-  ffts_t m79a = un_gray_code_c(m79);
-  
-  std::vector<int> syms(79);
-  for(int si = 0; si < 79; si++){
-    int best_tone = -1;
-    double best_amp = 0;
-    for(int bi = 0; bi < 8; bi++){
-      double amp = std::abs(m79a[si][bi]);
-      if(amp > best_amp || best_tone == -1){
-        best_tone = bi;
-        best_amp = amp;
-      }
-    }
-    syms[si] = best_tone;
-  }
-
-  std::vector<int> bits = extract_bits(syms);
-  assert(bits.size() == 174);
-
-  // turn bits into log-likihood for ldpc_decode.
-  // a zero bit is positive, a 1 bit is negative.
-  for(int i = 0; i < 174; i++){
-    if(bits[i]){
-      ll174[i] = -4.99;
-    } else {
-      ll174[i] = 4.99;
-    }
-  }
-}
-
 //
 // convert_to_snr(m79, snr_how, snr_win)
 //
@@ -2232,165 +2159,6 @@ one(const std::vector<double> &samples, double hz, int off)
   return ret;
 }
 
-// we got a decode.
-// re79 are the reconstructed correct symbols.
-// append to analyze.out.
-// the goal is to produce features for sklearn in
-// order to guess probability that the strongest
-// tone is actually incorrect. so we're only
-// producing rows for strongest tones.
-void
-analyze(const std::vector<double> &samples200,
-        const std::vector<int> &re79,
-        double best_hz,
-        int best_off)
-{
-  // mimic prepare_soft().
-  ffts_t c79 = extract(samples200, best_hz, best_off, 0);
-
-  // m79a = absolute values of c79.
-  // still pre-un-gray-coding so we know which
-  // are the correct Costas tones.
-  std::vector< std::vector<double> > m79a(79);
-  for(int si = 0; si < 79; si++){
-    m79a[si].resize(8);
-    for(int bi = 0; bi < 8; bi++){
-      m79a[si][bi] = std::abs(c79[si][bi]);
-    }
-  }
-
-  std::vector< std::vector<double> > m79 = convert_to_snr(m79a, snr_how, snr_win);
-
-  std::vector<Stats> noises0; // not best_in_noise
-  std::vector<Stats> noises1; // best_in_noise
-  std::vector<Stats> bests;
-  make_stats(m79, noises0, bests, 1, 0);
-  make_stats(m79, noises1, bests, 1, 1);
-
-  FILE *fp = fopen("analyze.out", "a");
-  for(int si = 0; si < 79; si++){
-    // set mxi to the index of the strongest tone.
-    double mx = -1;
-    int mxi = -1;
-    for(int bi = 0; bi < 8; bi++){
-      if(mxi < 0 || m79[si][bi] > mx){
-        mx = m79[si][bi];
-        mxi = bi;
-      }
-    }
-      
-    // a: correct tone?
-    // this is the "label", what ML is trying to predict.
-    fprintf(fp, "%d", mxi == re79[si]);
-
-    double x = m79[si][mxi];
-
-    // b: pseudo-snr from convert_to_snr.
-    fprintf(fp, " %f", x);
-
-    // c: fraction of the total power in this signal.
-    double sum = 0;
-    for(int bi = 0; bi < 8; bi++){
-      sum += m79[si][bi];
-    }
-    fprintf(fp, " %f", x / sum);
-
-    // sort the tones to find second-strongest.
-    std::vector<double> v(8);
-    for(int bi = 0; bi < 8; bi++){
-      double x = m79[si][bi];
-      v[bi] = x;
-    }
-    std::sort(v.begin(), v.end());
-    double x2 = v[6];
-
-    // d: second-strongest signal.
-    fprintf(fp, " %f", x2);
-
-    // e: ratio of strongest to second-strongest.
-    fprintf(fp, " %f", x / x2);
-
-    // f: difference
-    fprintf(fp, " %f", x - x2);
-
-    // g: relative to overall "best" mean.
-    fprintf(fp, " %f", x / bests[0].mean());
-
-    // h: relative to overall "noise" mean.
-    fprintf(fp, " %f", x / noises1[0].mean());
-
-    // i: P(best) from gaussian.
-    fprintf(fp, " %f", bests[0].problt(x, 0));
-
-    // j: P(best) from distribution.
-    fprintf(fp, " %f", bests[0].problt(x, 1));
-
-    // k: P(best) from distribution and logistic.
-    fprintf(fp, " %f", bests[0].problt(x, 2));
-
-    // l: P(best) from distribution and gaussian.
-    fprintf(fp, " %f", bests[0].problt(x, 3));
-
-    // m: P(best) from distribution and gaussian.
-    fprintf(fp, " %f", bests[0].problt(x, 4));
-
-    // n: second-strongest's P(best) from gaussian.
-    fprintf(fp, " %f", bests[0].problt(x2, 0));
-
-    // o: second-strongest's P(best) from distribution and gaussian.
-    fprintf(fp, " %f", bests[0].problt(x2, 3));
-
-
-    // p: P(noise) from gaussian.
-    fprintf(fp, " %f", noises0[0].problt(x, 0));
-
-    // q: P(noise) from distribution.
-    fprintf(fp, " %f", noises0[0].problt(x, 1));
-
-    // r: P(noise) from distribution and logistic.
-    fprintf(fp, " %f", noises0[0].problt(x, 2));
-
-    // s: P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises0[0].problt(x, 3));
-
-    // t: P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises0[0].problt(x, 4));
-
-    // u: second-strongest's P(noise) from gaussian.
-    fprintf(fp, " %f", noises0[0].problt(x2, 0));
-
-    // v: second-strongest's P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises0[0].problt(x2, 3));
-
-
-    // w: P(noise) from gaussian.
-    fprintf(fp, " %f", noises1[0].problt(x, 0));
-
-    // x: P(noise) from distribution.
-    fprintf(fp, " %f", noises1[0].problt(x, 1));
-
-    // y: P(noise) from distribution and logistic.
-    fprintf(fp, " %f", noises1[0].problt(x, 2));
-
-    // z: P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises1[0].problt(x, 3));
-
-    // aa: P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises1[0].problt(x, 4));
-
-    // bb: second-strongest's P(noise) from gaussian.
-    fprintf(fp, " %f", noises1[0].problt(x2, 0));
-
-    // cc: second-strongest's P(noise) from distribution and gaussian.
-    fprintf(fp, " %f", noises1[0].problt(x2, 3));
-
-    fprintf(fp, "\n");
-
-  }
-
-  fclose(fp);
-}
-
 // return 2 if it decodes to a brand-new message.
 // return 1 if it decodes but we've already seen it,
 //   perhaps in a different pass.
@@ -2520,7 +2288,6 @@ one_iter1(const std::vector<double> &samples200,
   ffts_t m79 = extract(samples200, best_hz, best_off, 0);
 
   double ll174[174];
-  //prepare_hard(m79, ll174);
   prepare_soft(m79, ll174, best_off);
 
 
@@ -2695,9 +2462,6 @@ try_decode(double ll174[174], const std::vector<double> &samples200,
 
     // reconstruct correct 79 symbols from LDPC output.
     std::vector<int> re79 = recode(a174);
-
-    // save some statistics.
-    //analyze(samples200, re79, best_hz, best_off);
 
     // and fine-tune offset and hz.
     double best_strength = 0;

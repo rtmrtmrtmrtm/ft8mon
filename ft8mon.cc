@@ -1,5 +1,5 @@
 //
-// decode FT8 from a sound card
+// main() routine to decode FT8 from a sound card.
 //
 // Robert Morris, AB1HL
 //
