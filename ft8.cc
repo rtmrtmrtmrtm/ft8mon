@@ -22,6 +22,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include "util.h"
 
 // 1920-point FFT at 12000 samples/second
 // 6.25 Hz spacing, 0.16 seconds/symbol
@@ -88,14 +89,6 @@ typedef std::vector< std::vector< std::complex<double> > > ffts_t;
 typedef int (*cb_t)(int *a91, double hz0, double hz1, double off,
                     const char *, double snr);
 
-double
-now()
-{
-  struct timeval tv;
-  gettimeofday(&tv, 0);
-  return tv.tv_sec + tv.tv_usec / 1000000.0;
-}
-
 //
 // return a Hamming window of length n.
 //
@@ -109,6 +102,9 @@ hamming(int n)
   return h;
 }
 
+//
+// blackman window
+//
 std::vector<double>
 blackman(int n)
 {
@@ -119,7 +115,9 @@ blackman(int n)
   return h;
 }
 
-// symmetric blackman
+//
+// symmetric blackman window
+//
 std::vector<double>
 sym_blackman(int n)
 {
@@ -133,6 +131,9 @@ sym_blackman(int n)
   return h;
 }
 
+//
+// blackman-harris window
+//
 std::vector<double>
 blackmanharris(int n)
 {
@@ -158,60 +159,9 @@ blackmanharris(int n)
   return h;
 }
 
-#include "sndfile.h"
-void
-writewav(const std::vector<double> &samples, const char *filename, int rate)
-{
-  double mx = 0;
-  for(int i = 0; i < samples.size(); i++){
-    if(abs(samples[i]) > mx)
-      mx = abs(samples[i]);
-  }
-  std::vector<double> v(samples.size());
-  for(int i = 0; i < samples.size(); i++){
-    v[i] = (samples[i] / mx) * (2000.0 / 32767.0);
-  }
-
-  SF_INFO sf;
-  sf.channels = 1;
-  sf.samplerate = rate;
-  sf.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
-  SNDFILE *f = sf_open(filename, SFM_WRITE, &sf);
-  assert(f);
-  sf_write_double(f, v.data(), v.size());
-  sf_write_sync(f);
-  sf_close(f);
-}
-
-std::vector<double>
-readwav(const char *filename, int &rate_out)
-{
-  SF_INFO info;
-  SNDFILE *sf = sf_open(filename, SFM_READ, &info);
-  if(sf == 0){
-    fprintf(stderr, "cannot open %s\n", filename);
-    exit(1); // XXX
-  }
-  rate_out = info.samplerate;
-  printf("rate %d, channels %d\n", info.samplerate, info.channels);
-
-  std::vector<double> out;
-
-  while(1){
-    double buf[512];
-    int n = sf_read_double(sf, buf, 512);
-    if(n <= 0)
-      break;
-    for(int i = 0; i < n; i++){
-      out.push_back(buf[i]);
-    }
-  }
-
-  sf_close(sf);
-
-  return out;
-}
-
+//
+// check the FT8 CRC-14
+//
 int
 check_crc(const int a91[91])
 {
@@ -230,7 +180,7 @@ check_crc(const int a91[91])
 
   extern void ft8_crc(int msg1[], int msglen, int out[14]);
 
-  // don't both with all-zero messages.
+  // don't bother with all-zero messages.
   if(non_zero == 0)
     return 0;
   
@@ -245,6 +195,11 @@ check_crc(const int a91[91])
   return 1;
 }
 
+//
+// manage statistics for soft decoding, to help
+// decide how likely each symbol is to be correct,
+// to drive LDPC decoding.
+//
 class Stats {
 public:
   std::vector<double> a_;
@@ -394,13 +349,6 @@ double apriori174[] = {
   0.46, 0.51, 0.51, 0.52, 0.49, 0.51, 0.49, 0.51, 0.50, 0.49, 0.50,
   0.50, 0.47, 0.49, 0.52, 0.49, 0.51, 0.49, 0.48, 0.52, 0.48, 0.49,
   0.47, 0.50, 0.48, 0.50, 0.49, 0.51, 0.51, 0.51, 0.49,
-};
-
-class Strength {
-public:
-  double hz_;
-  int off_;
-  double strength_; // higher is better
 };
 
 // a cached fftw plan, for both of:
@@ -736,46 +684,6 @@ one_fft_c(const std::vector<double> &samples, int i0, int block)
   return out;
 }
 
-// not used
-std::vector<double>
-iffts(const ffts_t &ffts)
-{
-  int nblocks = ffts.size();
-  int nbins = ffts[0].size();
-  int block = (nbins - 1) * 2;
-  int nsamples = block * nblocks;
-  std::vector<double> samples(nsamples);
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.rev_;
-
-  fftw_complex *m_in = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                    ((p.n_ / 2) + 1));
-  double *m_out = (double *) fftw_malloc(sizeof(double) * p.n_);
-
-  for(int si = 0; si < ffts.size(); si++){
-    for(int bi = 0; bi < nbins; bi++){
-      double re = ffts[si][bi].real();
-      double im = ffts[si][bi].imag();
-      m_in[bi][0] = re;
-      m_in[bi][1] = im;
-    }
-
-    fftw_execute_dft_c2r(m_plan, m_in, m_out);
-
-    int off = si * block;
-    for(int i = 0; i < block; i++){
-      samples[off + i] = m_out[i];
-    }
-  }
-
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return samples;
-}
-
 std::vector<double>
 one_ifft(const std::vector<std::complex<double>> &bins)
 {
@@ -893,12 +801,9 @@ analytic(const std::vector<double> &x)
 // is expensive, and often re-used, but it turns out it
 // isn't a big factor in overall run-time.
 //
-// like weakutil.py's freq_shift().
-//
 std::vector<double>
 hilbert_shift(const std::vector<double> &x, double hz0, double hz1, int rate)
 {
-  // y = scipy.signal.hilbert(x)
   std::vector<std::complex<double>> y = analytic(x);
   assert(y.size() == x.size());
 
@@ -951,6 +856,17 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
   }
 }
 
+class Strength {
+public:
+  double hz_;
+  int off_;
+  double strength_; // higher is better
+};
+
+//
+// look for potential signals by searching FFT bins for Costas symbol
+// blocks. returns a vector of candidate positions.
+//
 std::vector<Strength>
 coarse(const ffts_t &bins, int si0, int si1)
 {
@@ -997,8 +913,8 @@ coarse(const ffts_t &bins, int si0, int si1)
 }
 
 //
-// change rate.
-// interpolates brate doesn't divide arate.
+// change the sample rate rate.
+// interpolates if brate doesn't divide arate.
 // caller must have low-passed filtered.
 //
 std::vector<double>
@@ -1258,6 +1174,12 @@ one_strength(const std::vector<double> &samples200, double hz, int off)
   return sum;
 }
 
+//
+// given a complete known signal's symbols in syms,
+// how strong is it? used to look for the best
+// offset and frequency at which to subtract a
+// decoded signal.
+//
 double
 one_strength_known(const std::vector<double> &samples200,
                    const std::vector<int> syms,
@@ -1434,10 +1356,12 @@ search_both_known(const std::vector<double> &samples200,
   }
 }
 
-// one giant FFT.
+//
+// shift frequency by shifting the bins of one giant FFT.
 // so no problem with phase mismatch &c at block boundaries.
 // surprisingly fast at 200 samples/second.
 // shifts *down* by hz.
+//
 std::vector<double>
 fft_shift(const std::vector<double> &samples, int off, int len,
           int rate, double hz)
@@ -1588,11 +1512,8 @@ extract_bits(const std::vector<int> &syms)
 }
 
 //
-// convert_to_snr(m79, snr_how, snr_win)
-//
-// hack to normalize levels by windowed median.
+// normalize levels by windowed median.
 // this helps, but why?
-//
 //
 std::vector< std::vector<double> >
 convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
@@ -1663,11 +1584,14 @@ convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
   return n79;
 }
 
-// statistics to decide soft probabilities.
+//
+// statistics to decide soft probabilities,
+// to drive LDPC decoder.
 // distribution of strongest tones, and
 // distribution of noise.
 // multiple ranges in case things change over time.
 // nranges is soft_ranges.
+//
 void
 make_stats(const std::vector<std::vector<double>> &m79,
            std::vector<Stats> &noises,
@@ -1861,6 +1785,9 @@ prepare_soft(const ffts_t &c79, double ll174[], int best_off)
   assert(lli == 174);
 }
 
+//
+// given log likelyhood for each bit, try LDPC and OSD decoders.
+//
 int
 decode(const double ll174[], int a174[], int use_osd, std::string &comment)
 {
@@ -1903,10 +1830,11 @@ decode(const double ll174[], int a174[], int use_osd, std::string &comment)
 }
 
 //
+// move hz down to 25, filter+convert to 200 samples/second.
+//
 // like fft_shift(). one big FFT, move bins down and
 // zero out those outside the band, then IFFT,
 // then re-sample.
-// moves hz down to 25.
 //
 // XXX maybe merge w/ fft_shift() / shift200().
 //
@@ -1989,146 +1917,6 @@ down_v7(const std::vector<double> &samples, double hz)
 
   return out;
 }
-
-std::vector<double>
-bandpass_fir(const std::vector<double> &samples, int rate, int symsamples, double hz0, double hz1)
-{
-  int block = bandpass_block * symsamples;
-  
-  // FIR taps for a hz0..hz1 bandpass filter, via inverse FFT.
-  double bin_hz = rate / (double) block;
-  int bin0 = round(hz0 / bin_hz);
-  int bin1 = round(hz1 / bin_hz);
-  int nbins = (block / 2) + 1;
-  std::vector<std::complex<double>> bins(nbins);
-  for(int i = 0; i < nbins; i++){
-    bins[i] = 0;
-  }
-  for(int i = bin0; i < bin1; i++){
-    if(i >= 0 && i < nbins){
-      bins[i] = 1;
-    }
-  }
-  std::vector<double> taps1 = one_ifft(bins);
-  int xntaps = taps1.size();
-
-  // unwrap IFFT output.
-  std::vector<double> xtaps(xntaps);
-  for(int i = 0; i < xntaps; i++){
-    int ii = (i+(xntaps/2)) % xntaps;
-    xtaps[i] = taps1[ii];
-  }
-
-  // drop the first tap.
-  int ntaps = xntaps - 1;
-  std::vector<double> taps(ntaps);
-  for(int i = 0; i < ntaps; i++){
-    taps[i] = xtaps[i+1];
-  }
-
-  std::vector<double> win;
-  if(win_type == 1){
-    win = blackman(ntaps);
-  } else if(win_type == 2){
-    win = blackmanharris(ntaps);
-  } else if(win_type == 3){
-    win = hamming(ntaps);
-  } else if(win_type == 4){
-    win = sym_blackman(ntaps);
-  } else {
-    assert(0);
-  }
-  for(int i = 0; i < ntaps; i++){
-    taps[i] *= win[i];
-    taps[i] /= taps.size();
-  }
-
-  if(0){
-    FILE *fp = fopen("x", "w");
-    for(int i = 0; i < (int)taps.size(); i++){
-      fprintf(fp, "%.12f\n", taps[i]);
-    }
-    fclose(fp);
-    fprintf(stderr, "%lu taps for %.2f .. %.2f\n", taps.size(), hz0, hz1);
-    exit(0);
-  }
-
-  int len = samples.size();
-  std::vector<double> out(len);
-
-  for(int out_i = 0; out_i < len; out_i++){
-    double x = 0;
-    
-    // start at samples[in_i] to compensate for delay.
-    int in_i = out_i - (ntaps / 2);
-    
-    for(int k = 0; k < ntaps; k++){
-      if(in_i + k >= 0 && in_i + k < len){
-        x += samples[in_i + k] * taps[ntaps-1-k];
-      }
-    }
-    out[out_i] = x;
-  }
-  
-  return out;
-}
-
-#if 0
-//
-// IIR using the Liquid DSP library.
-// code is from Liquid DSP examples.
-//
-std::vector<double>
-bandpass(const std::vector<double> &samples, int rate, int symsamples, double hz0, double hz1)
-{
-  if(hz0 < 10)
-    hz0 = 10;
-  if(hz1 > (rate/2) - 10)
-    hz1 = (rate/2) - 10;
-  
-  double fc = hz0 / rate; // low cutoff
-  double f0 = 0.5 * (hz0 + hz1) / rate; // center frequency
-
-  // XXX try Butter and Cheby type II and Elliptical
-  
-  //printf("rate=%d, %.1f %.1f, %.3f %.3f\n", rate, hz0, hz1, fc, f0);
-  
-  iirfilt_rrrf ff = iirfilt_rrrf_create_prototype((liquid_iirdes_filtertype) bandpass_type,
-                                                  LIQUID_IIRDES_BANDPASS,
-                                                  LIQUID_IIRDES_SOS,
-                                                  bandpass_order,
-                                                  fc, f0,
-                                                  bandpass_pass_db,
-                                                  bandpass_stop_db);
-
-  int n = samples.size();
-  std::vector<double> out(n);
-
-  // filter delays by this many samples.
-  // compensate so that subtraction aligns well.
-  int delay = iirfilt_rrrf_groupdelay(ff, f0);
-
-  // XXX filtfilt?
-
-  for(int i = 0; i < n; i++){
-    float x = samples[i];
-    float y = 0;
-    iirfilt_rrrf_execute(ff, x, &y);
-    if(i >= delay)
-      out[i-delay] = y;
-  }
-
-  for(int i = 0; i < delay; i++){
-    float y = 0;
-    iirfilt_rrrf_execute(ff, 0, &y);
-    out[n-delay+i] = y;
-  }
-
-  iirfilt_rrrf_destroy(ff);
-
-  return out;
-}
-#endif
 
 //
 // putative start of signal is at hz and symbol si0.
@@ -2355,7 +2143,9 @@ one_iter1(const std::vector<double> &samples200,
 }
 
 //
-// subtract a corrected decoded signal from nsamples_.
+// subtract a corrected decoded signal from nsamples_,
+// perhaps revealing a weaker signal underneath,
+// to be decoded in a subsequent pass.
 // re79 is the corrected symbol numbers, as sent over the air.
 //
 // just zeros out the relevant bin.
@@ -2444,10 +2234,14 @@ subtract(const std::vector<int> re79,
   nsamples_ = hilbert_shift(moved, -diff0, -diff1, rate_);
 }
 
+//
+// decode, give to callback, and subtract.
+//
 // return 2 if it decodes to a brand-new message.
 // return 1 if it decodes but we've already seen it,
 //   perhaps in a different pass.
 // return 0 if we could not decode.
+//
 int
 try_decode(double ll174[174], const std::vector<double> &samples200,
            double best_hz, int best_off, double hz0_for_cb, double hz1_for_cb,
@@ -2500,9 +2294,13 @@ try_decode(double ll174[174], const std::vector<double> &samples200,
   }
 }
 
+//
 // given 174 bits corrected by LDPC, work
 // backwards to the symbols that must have
 // been sent.
+// used to help ensure that subtraction subtracts
+// at the right place.
+//
 std::vector<int>
 recode(int a174[])
 {
@@ -2536,72 +2334,6 @@ std::vector<Plan> FT8::plans_;
 int FT8::plan_master_pid_ = -1;
 std::mutex FT8::plans_mu_;
 std::mutex FT8::cb_mu_;
-
-void
-test_analytic()
-{
-  FT8 ft8;
-
-  std::vector<double> x(8);
-  x[0] = 1;
-  x[1] = 2;
-  x[2] = 3;
-  x[3] = 4;
-  x[4] = 1;
-  x[5] = 2;
-  x[6] = 3;
-  x[7] = 4;
-  std::vector<std::complex<double>> a = ft8.analytic(x);
-
-  assert(a.size() == x.size());
-
-  //for(int i = 0; i < a.size(); i++){
-  //  printf("%f+j%f\n", a[i].real(), a[i].imag());
-  //}
-
-  // a[] should be:
-  // 1.000000+j1.000000
-  // 2.000000+j-1.000000
-  // 3.000000+j-1.000000
-  // 4.000000+j1.000000
-  // 1.000000+j1.000000
-  // 2.000000+j-1.000000
-  // 3.000000+j-1.000000
-  // 4.000000+j1.000000
-}
-
-void
-test_hilbert_shift()
-{
-  FT8 ft8;
-
-  std::vector<double> x(8);
-  x[0] = 1;
-  x[1] = 2;
-  x[2] = 3;
-  x[3] = 4;
-  x[4] = 1;
-  x[5] = 2;
-  x[6] = 3;
-  x[7] = 4;
-
-  std::vector<double> y = ft8.hilbert_shift(x, 1.0, 1.0, 8);
-  assert(y.size() == x.size());
-
-  //for(int i = 0; i < y.size(); i++){
-  //  printf("%f\n", y[i]);
-  //}
-
-  // y should be:
-  // 1.000000
-  // 2.121320
-  // 1.000000
-  // -3.535534
-  // -1.000000
-  // -2.121320
-  // -1.000000
-  // 3.535534
-}
 
 extern "C" {
   // let Python call just entry(), rather than a C++ mangled name.

@@ -1,5 +1,5 @@
 //
-// main() routine to decode FT8 from a sound card.
+// decode FT8 from a sound card
 //
 // Robert Morris, AB1HL
 //
@@ -55,6 +55,7 @@ void
 usage()
 {
   fprintf(stderr, "Usage: ft8mon -card card-num channel\n");
+  fprintf(stderr, "       ft8mon -file xxx.wav\n");
   snd_list();
   exit(1);
 }
@@ -62,6 +63,8 @@ usage()
 int
 main(int argc, char *argv[])
 {
+  int hints[2] = { 2, 0 }; // CQ
+
   // avoid snd card input overruns.
   // it's not clear why there's a problem.
   extern int fftw_type;
@@ -91,7 +94,6 @@ main(int argc, char *argv[])
 
         long long nominal = samples.size() - rate * (ttt_end - cycle_start - 0.5);
         if(nominal >= 0){
-          int hints[2] = { 2, 0 };
           saved_cycle_start = cycle_start; // for hcb() callback
           entry(samples.data(), samples.size(), nominal, rate,
                 150,
@@ -103,6 +105,14 @@ main(int argc, char *argv[])
       }
       usleep(100 * 1000); // 0.1 seconds
     }
+  } else if(argc == 3 && strcmp(argv[1], "-file") == 0){
+    // the .wav file should start at an even 15-second boundary.
+    int rate;
+    std::vector<double> s = readwav(argv[2], rate);
+    entry(s.data(), s.size(), 0.5 * rate, rate,
+          150,
+          2900,
+          hints, hints, 4, 6, hcb);
   } else {
     usage();
   }
