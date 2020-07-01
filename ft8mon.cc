@@ -11,6 +11,7 @@
 #include <vector>
 #include <fftw3.h>
 #include <time.h>
+#include <string.h>
 #include "snd.h"
 #include "util.h"
 #include "unpack.h"

@@ -2,6 +2,7 @@
 #include <mutex>
 #include <map>
 #include <string.h>
+#include <assert.h>
 #include "unpack.h"
 
 //
