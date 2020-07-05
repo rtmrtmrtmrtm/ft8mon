@@ -65,6 +65,7 @@ int
 main(int argc, char *argv[])
 {
   int hints[2] = { 2, 0 }; // CQ
+  double budget = 5; // compute for this many seconds per cycle
 
   // avoid snd card input overruns.
   // it's not clear why there's a problem.
@@ -72,7 +73,7 @@ main(int argc, char *argv[])
   fftw_type = FFTW_ESTIMATE; // rather than FFTW_MEASURE
 
   extern int nthreads;
-  nthreads = 4;
+  nthreads = 4; // use four cores in parallel
   
   if(argc == 4 && strcmp(argv[1], "-card") == 0){
     CardSoundIn *sin = new CardSoundIn(atoi(argv[2]), atoi(argv[3]));
@@ -99,7 +100,7 @@ main(int argc, char *argv[])
           entry(samples.data(), samples.size(), nominal, rate,
                 150,
                 2900,
-                hints, hints, 4, 6, hcb);
+                hints, hints, budget, budget, hcb);
         }
 
         sleep(2);
@@ -113,7 +114,7 @@ main(int argc, char *argv[])
     entry(s.data(), s.size(), 0.5 * rate, rate,
           150,
           2900,
-          hints, hints, 4, 6, hcb);
+          hints, hints, budget, budget, hcb);
   } else {
     usage();
   }

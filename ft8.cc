@@ -38,11 +38,13 @@
 // total transmission time is 12.64 seconds
 
 // tunable parameters
+int nthreads = 2; // number of parallel threads, for multi-core
+int npasses = 3;  // number of spectral subtraction passes
+int ldpc_iters = 25; // how hard LDPC decoding should work
 int snr_win = 5;
 int snr_how = 0;
 int soft_ranges = 1;
 int best_in_noise = 1;
-int ldpc_iters = 25;
 double shoulder = 10; // for bandpass filter
 double shoulder_extra = 0.0; // for bandpass filter
 double bandpass_block = 1.0; // units are symbol times
@@ -63,7 +65,7 @@ double log_rate = 8.0;
 int problt_how = 3;
 int use_apriori = 1;
 int use_hints = 1; // 1 means use all hints, 2 means just CQ hints
-double drift =  -1; // 2.0;
+double drift =  -1;
 int win_type = 1;
 int osd_depth = 6; // don't increase beyond 6, produces too much garbage
 int osd_ldpc_thresh = 70; // demand this many correct LDPC parity bits for OSD
@@ -74,8 +76,6 @@ double tplus = 2.7;
 int coarse_off_fracs = 4;
 int coarse_hz_fracs = 4;
 double already_hz = 27;
-int nthreads = 2;
-int npasses = 3;
 double overlap = 0;
 int sub_amp_win = 0;
 double nyquist = 0.85;
@@ -438,16 +438,6 @@ public:
     hack_data_ = 0;
     hack_off_ = -1;
     hack_len_ = -1;
-
-    setup();
-  }
-
-  // for testing.
-  FT8() {
-    setup();
-  }
-
-  void setup() {
   }
 
   ~FT8() {
