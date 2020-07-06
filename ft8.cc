@@ -41,17 +41,12 @@
 int nthreads = 2; // number of parallel threads, for multi-core
 int npasses = 3;  // number of spectral subtraction passes
 int ldpc_iters = 25; // how hard LDPC decoding should work
-int snr_win = 5;
-int snr_how = 0;
+int snr_win = 5; // averaging window, in symbols, for SNR conversion
+int snr_how = 0; // technique to measure "N" for SNR. 0 means median of the 8 tones.
 int soft_ranges = 1;
 int best_in_noise = 1;
 double shoulder = 10; // for bandpass filter
 double shoulder_extra = 0.0; // for bandpass filter
-double bandpass_block = 1.0; // units are symbol times
-int bandpass_order = 4;
-int bandpass_type = 0; // 0=BUTTER, 2=CHEBY2, 3=ELLIP
-double bandpass_stop_db = 60;
-double bandpass_pass_db = 1; // passband ripple
 double second_hz_inc = 1.2; // second search_both()
 double second_hz_win = 2.7;
 double second_off_inc = 0.2;
@@ -2399,11 +2394,6 @@ set(char *param, char *val)
      { "ldpc_iters", &ldpc_iters, 0 },
      { "shoulder", &shoulder, 1 },
      { "shoulder_extra", &shoulder_extra, 1 },
-     { "bandpass_block", &bandpass_block, 1 },
-     { "bandpass_order", &bandpass_order, 0 },
-     { "bandpass_type", &bandpass_type, 0 },
-     { "bandpass_stop_db", &bandpass_stop_db, 1 },
-     { "bandpass_pass_db", &bandpass_pass_db, 1 },
      { "second_hz_inc", &second_hz_inc, 1 },
      { "second_hz_win", &second_hz_win, 1 },
      { "second_off_inc", &second_off_inc, 1 },

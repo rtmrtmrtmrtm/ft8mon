@@ -91,6 +91,6 @@ class SoundOut {
   void write(const std::vector<short int> &);
 };
 
-void levels(int card);
+void levels(int card, int chan);
 
 #endif

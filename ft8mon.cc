@@ -55,7 +55,8 @@ hcb(int *a91, double hz0, double hz1, double off,
 void
 usage()
 {
-  fprintf(stderr, "Usage: ft8mon -card card-num channel\n");
+  fprintf(stderr, "Usage: ft8mon -card card channel\n");
+  fprintf(stderr, "       ft8mon -levels card channel\n");
   fprintf(stderr, "       ft8mon -file xxx.wav\n");
   snd_list();
   exit(1);
@@ -76,7 +77,9 @@ main(int argc, char *argv[])
   nthreads = 4; // use four cores in parallel
   
   if(argc == 4 && strcmp(argv[1], "-card") == 0){
-    CardSoundIn *sin = new CardSoundIn(atoi(argv[2]), atoi(argv[3]));
+    int card = atoi(argv[2]);
+    int chan = atoi(argv[3]);
+    CardSoundIn *sin = new CardSoundIn(card, chan);
     sin->start();
     int rate = sin->rate();
 
@@ -107,6 +110,10 @@ main(int argc, char *argv[])
       }
       usleep(100 * 1000); // 0.1 seconds
     }
+  } else if(argc == 4 && strcmp(argv[1], "-levels") == 0){
+    int card = atoi(argv[2]);
+    int chan = atoi(argv[3]);
+    levels(card, chan);
   } else if(argc == 3 && strcmp(argv[1], "-file") == 0){
     // the .wav file should start at an even 15-second boundary.
     int rate;

@@ -69,10 +69,10 @@ snd_list()
 // print avg and peak each second.
 //
 void
-levels(int card)
+levels(int card, int chan)
 {
   snd_init();
-  CardSoundIn *sin = new CardSoundIn(card, 0);
+  CardSoundIn *sin = new CardSoundIn(card, chan);
   sin->start();
 
   double max = 0;
