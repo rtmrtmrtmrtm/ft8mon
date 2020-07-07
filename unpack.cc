@@ -194,6 +194,17 @@ unpackgrid(int ng, int ir, int i3)
   return tmp;
 }
 
+void
+remember_call(std::string call)
+{
+  hashes_mu.lock();
+  if(call.size() >= 3 && call[0] != '<'){
+    hashes22[ihashcall(call, 22)] = call;
+    hashes12[ihashcall(call, 12)] = call;
+  }
+  hashes_mu.unlock();
+}
+
 //
 // i3 == 4
 // a call that doesn't fit in 28 bits.
@@ -216,10 +227,7 @@ unpack_4(int a77[])
   }
   call[11] = '\0';
 
-  hashes_mu.lock();
-  hashes22[ihashcall(call, 22)] = call;
-  hashes12[ihashcall(call, 12)] = call;
-  hashes_mu.unlock();
+  remember_call(call);
 
   if(un(a77, 73, 1) == 1){
     return std::string("CQ ") + call;
@@ -292,16 +300,8 @@ unpack_1(int a77[])
   std::string call2text = unpackcall(call2);
   std::string gridtext = unpackgrid(grid, ir, i3);
 
-  hashes_mu.lock();
-  if(call1text[0] != '<'){
-    hashes22[ihashcall(call1text, 22)] = call1text;
-    hashes12[ihashcall(call1text, 12)] = call1text;
-  }
-  if(call2text[0] != '<'){
-    hashes22[ihashcall(call2text, 22)] = call2text;
-    hashes12[ihashcall(call2text, 12)] = call2text;
-  }
-  hashes_mu.unlock();
+  remember_call(call1text);
+  remember_call(call2text);
 
   const char *pr = (i3 == 1 ? "/R" : "/P");
 
@@ -326,6 +326,134 @@ unpack_0_0(int a77[])
   return msg;
 }
 
+// ARRL RTTY Round-Up states/provinces
+const char *ru_states[] = {
+       "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
+       "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
+       "MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+       "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC",
+       "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY",
+       "NB","NS","QC","ON","MB","SK","AB","BC","NWT","NF",
+       "LB","NU","YT","PEI","DC"
+};
+
+// i3=3
+// 3     TU; W9XYZ K1ABC R 579 MA           1 28 28 1 3 13   74   ARRL RTTY Roundup
+//  1 TU
+// 28 call1
+// 28 call2
+//  1 R
+//  3 RST 529 to 599
+// 13 state/province/serialnumber
+std::string
+unpack_3(int a77[])
+{
+  int i = 0;
+  int tu = a77[i];
+  i += 1;
+  int call1 = un(a77, i, 28);
+  i += 28;
+  int call2 = un(a77, i, 28);
+  i += 28;
+  int r = a77[i];
+  i += 1;
+  int rst = un(a77, i, 3);
+  i += 3;
+  int serial = un(a77, i, 13);
+  i += 13;
+
+  std::string call1text = unpackcall(call1);
+  std::string call2text = unpackcall(call2);
+
+  rst = 529 + 10*rst;
+
+  int statei = serial - 8001;
+  std::string serialstr;
+  int nstates = sizeof(ru_states) / sizeof(ru_states[0]);
+  if(serial > 8000 && statei < nstates){
+    serialstr = ru_states[statei];
+  } else {
+    char tmp[32];
+    sprintf(tmp, "%04d", serial);
+    serialstr = tmp;
+  }
+
+  std::string msg;
+
+  if(tu){
+    msg += "TU; ";
+  }
+  msg += call1text + " " + call2text + " ";
+  if(r){
+    msg += "R ";
+  }
+  {
+    char tmp[16];
+    sprintf(tmp, "%d ", rst);
+    msg += tmp;
+  }
+  msg += serialstr;
+
+  remember_call(call1text);
+  remember_call(call2text);
+
+  return msg;
+}
+
+// ARRL Field Day sections
+const char *sections[] = {
+       "AB ","AK ","AL ","AR ","AZ ","BC ","CO ","CT ","DE ","EB ",
+       "EMA","ENY","EPA","EWA","GA ","GTA","IA ","ID ","IL ","IN ",
+       "KS ","KY ","LA ","LAX","MAR","MB ","MDC","ME ","MI ","MN ",
+       "MO ","MS ","MT ","NC ","ND ","NE ","NFL","NH ","NL ","NLI",
+       "NM ","NNJ","NNY","NT ","NTX","NV ","OH ","OK ","ONE","ONN",
+       "ONS","OR ","ORG","PAC","PR ","QC ","RI ","SB ","SC ","SCV",
+       "SD ","SDG","SF ","SFL","SJV","SK ","SNJ","STX","SV ","TN ",
+       "UT ","VA ","VI ","VT ","WCF","WI ","WMA","WNY","WPA","WTX",
+       "WV ","WWA","WY ","DX "
+};
+
+// i3 = 0, n3 = 3 or 4: ARRL Field Day
+// 0.3   WA9XYZ KA1ABC R 16A EMA            28 28 1 4 3 7    71   ARRL Field Day
+// 0.4   WA9XYZ KA1ABC R 32A EMA            28 28 1 4 3 7    71   ARRL Field Day
+std::string
+unpack_0_3(int a77[], int n3)
+{
+  int i = 0;
+  int call1 = un(a77, i, 28);
+  i += 28;
+  int call2 = un(a77, i, 28);
+  i += 28;
+  int R = un(a77, i, 1);
+  i += 1;
+  int n_transmitters = un(a77, i, 4);
+  if(n3 == 4)
+    n_transmitters += 16;
+  i += 4;
+  int clss = un(a77, i, 3); // class
+  i += 3;
+  int section = un(a77, i, 7); // ARRL section
+  i += 7;
+
+  std::string msg;
+  msg += unpackcall(call1);
+  msg += " ";
+  msg += unpackcall(call2);
+  msg += " ";
+  if(R)
+    msg += "R ";
+  {
+    char tmp[16];
+    sprintf(tmp, "%d%c ", n_transmitters + 1, clss + 'A');
+    msg += tmp;
+  }
+  if(section-1 >= 0 && section-1 < sizeof(sections)/sizeof(sections[0])){
+    msg += sections[section-1];
+  }
+
+  return msg;
+}
+
 //
 // unpack an FT8 message.
 // a77 is 91 bits -- 77 plus the 14-bit CRC.
@@ -343,9 +471,19 @@ unpack(int a77[])
     return unpack_0_0(a77);
   }
 
+  if(i3 == 0 && (n3 == 3 || n3 == 4)){
+    // ARRL Field Day
+    return unpack_0_3(a77, n3);
+  }
+
   if(i3 == 1 || i3 == 2){
     // ordinary message
     return unpack_1(a77);
+  }
+
+  if(i3 == 3){
+    // RTTY Round-Up
+    return unpack_3(a77);
   }
 
   if(i3 == 4){

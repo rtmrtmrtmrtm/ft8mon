@@ -57,8 +57,8 @@ usage()
 {
   fprintf(stderr, "Usage: ft8mon -card card channel\n");
   fprintf(stderr, "       ft8mon -levels card channel\n");
+  fprintf(stderr, "       ft8mon -list\n");
   fprintf(stderr, "       ft8mon -file xxx.wav\n");
-  snd_list();
   exit(1);
 }
 
@@ -122,6 +122,8 @@ main(int argc, char *argv[])
           150,
           2900,
           hints, hints, budget, budget, hcb);
+  } else if(argc == 2 && strcmp(argv[1], "-list") == 0){
+    snd_list();
   } else {
     usage();
   }
