@@ -6,15 +6,15 @@
 #include "unpack.h"
 
 //
-// turn bits into an integer.
+// turn bits into a 128-bit integer.
 // most significant bit first.
 //
-long long
+__int128
 un(int a77[], int start, int len)
 {
-  long long x = 0;
+  __int128 x = 0;
 
-  assert(len < 64 && start >= 0 && start + len <= 77);
+  assert(len < sizeof(x)*8 && start >= 0 && start + len <= 77);
   for(int i = 0; i < len; i++){
     x <<= 1;
     x |= a77[start+i];
@@ -142,7 +142,7 @@ unpackcall(int x)
 std::string
 unpackgrid(int ng, int ir, int i3)
 {
-  assert(i3 == 1);
+  assert(i3 == 1 || i3 == 2);
 
   if(ng < NGBASE){
     // maidenhead grid system:
@@ -286,7 +286,7 @@ unpack_1(int a77[])
   i += 15;
   int i3 = un(a77, i, 3);
   i += 3;
-  assert(i3 == 1 && i == 77);
+  assert((i3 == 1 || i3 == 2) && i == 77);
 
   std::string call1text = unpackcall(call1);
   std::string call2text = unpackcall(call2);
@@ -303,7 +303,27 @@ unpack_1(int a77[])
   }
   hashes_mu.unlock();
 
-  return call1text + " " + call2text + " " + gridtext;
+  const char *pr = (i3 == 1 ? "/R" : "/P");
+
+  return call1text + (rover1 ? pr : "") + " " + call2text + (rover2 ? pr : "") + " " + gridtext;
+}
+
+// free text
+// 71 bits, 13 characters, each one of 42 choices.
+// reversed.
+// details from wsjt-x's packjt77.f90
+std::string
+unpack_0_0(int a77[])
+{
+  // the 42 possible characters.
+  const char *cc = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
+  __int128 x = un(a77, 0, 71);
+  std::string msg = "0123456789123";
+  for(int i = 0; i < 13; i++){
+    msg[13-1-i] = cc[x % 42];
+    x = x / 42;
+  }
+  return msg;
 }
 
 //
@@ -318,11 +338,18 @@ unpack(int a77[])
   int i3 = un(a77, 74, 3);
   int n3 = un(a77, 71, 3);
 
-  if(i3 == 1){
+  if(i3 == 0 && n3 == 0){
+    // free text
+    return unpack_0_0(a77);
+  }
+
+  if(i3 == 1 || i3 == 2){
+    // ordinary message
     return unpack_1(a77);
   }
 
   if(i3 == 4){
+    // call that doesn't fit in 28 bits
     return unpack_4(a77);
   }
 
