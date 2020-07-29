@@ -1,3 +1,4 @@
+#include "snd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -6,9 +7,10 @@
 #include <string>
 #include <string.h>
 #include <math.h>
-#include "snd.h"
 #include "util.h"
+#include "fft.h"
 #include <portaudio.h>
+#include <ctype.h>
 
 void
 snd_init()
@@ -63,25 +65,44 @@ snd_list()
 
     printf("\n");
   }
+
+#ifdef AIRSPYHF
+  int ndev = airspyhf_list_devices(0, 0);
+  if(ndev > 0){
+    unsigned long long serials[20];
+    if(ndev > 20)
+      ndev = 20;
+    airspyhf_list_devices(serials, ndev);
+    for(int i = 0; i < ndev; i++){
+      airspyhf_device_t *dev = 0;
+      if(airspyhf_open_sn(&dev, serials[i]) == AIRSPYHF_SUCCESS){
+        airspyhf_read_partid_serialno_t read_partid_serialno;
+        airspyhf_board_partid_serialno_read(dev, &read_partid_serialno);
+        printf("Airspy HF+ S/N %08X%08X\n",
+               read_partid_serialno.serial_no[0],
+               read_partid_serialno.serial_no[1]);
+      } else {
+        fprintf(stderr, "could not open airspyhf serial %llu\n", serials[i]);
+      }
+    }
+  }
+#endif
 }
 
 //
 // print avg and peak each second.
 //
 void
-levels(int card, int chan)
+SoundIn::levels()
 {
-  snd_init();
-  CardSoundIn *sin = new CardSoundIn(card, chan);
-  sin->start();
-
   double max = 0;
   double sum = 0;
   int n = 0;
+  double last_t = now();
 
   while(1){
     double dummy;
-    std::vector<double> buf = sin->get(1024, dummy);
+    std::vector<double> buf = get(rate(), dummy);
     if(buf.size() == 0)
       usleep(100*1000);
     for(int i = 0; i < buf.size(); i++){
@@ -90,14 +111,40 @@ levels(int card, int chan)
       if(fabs(buf[i]) > max){
         max = fabs(buf[i]);
       }
-      if(n >= sin->rate()){
-        printf("%f %f\n", sum / n, max);
+      if(n >= rate()){
+        printf("avg=%.3f peak=%.3f rate=%.1f\n", sum / n, max, n / (now() - last_t));
         n = 0;
         sum = 0;
         max = 0;
+        last_t = now();
       }
     }
   }
+}
+
+//
+// generic open
+//
+SoundIn *
+SoundIn::open(std::string card, std::string chan)
+{
+  assert(card.size() > 0);
+  SoundIn *sin;
+
+  if(isdigit(card[0])){
+    sin = new CardSoundIn(atoi(card.c_str()), atoi(chan.c_str()));
+  } else if(card == "file"){
+    sin = new FileSoundIn(chan);
+#ifdef AIRSPYHF
+  } else if(card == "airspy"){
+    sin = new AirspySoundIn(chan);
+#endif
+  } else {
+    fprintf(stderr, "SoundIn::open(%s, %s): type not recognized\n", card.c_str(), chan.c_str());
+    exit(1);
+  }
+
+  return sin;
 }
   
 int
@@ -114,7 +161,7 @@ CardSoundIn::cb(const void *input,
   if(statusFlags != 0){
     // 2 is paInputOverflow
     fprintf(stderr, "CardSoundIn::cb statusFlags 0x%x\n", (int)statusFlags);
-    exit(1); // XXX
+    exit(1);
   }
 
   for(int i = 0; i < frameCount; i++){
@@ -123,7 +170,7 @@ CardSoundIn::cb(const void *input,
       sin->wi_ = (sin->wi_ + 1) % sin->n_;
     } else {
       fprintf(stderr, "CardSoundIn::cb buf_ overflow\n");
-      exit(1); // XXX
+      exit(1);
       break;
     }
   }
@@ -208,7 +255,8 @@ CardSoundIn::start()
   ip.device = card_;
   ip.channelCount = channels_;
   ip.sampleFormat = paInt16;
-  ip.suggestedLatency = 0;
+  // don't set latency to zero; this causes problems on Linux.
+  ip.suggestedLatency = Pa_GetDeviceInfo(card_)->defaultLowInputLatency;
   ip.hostApiSpecificStreamInfo = 0;
   
   PaStream *str = 0;
@@ -247,6 +295,200 @@ CardSoundIn::start()
 
 }
 
+#ifdef AIRSPYHF
+//
+// chan argument is megahertz.
+//
+AirspySoundIn::AirspySoundIn(std::string chan)
+{
+  device_ = 0;
+  hz_ = 1000000.0 * atof(chan.c_str());
+  air_rate_ = 192 * 1000;;
+  rate_ = 12000;
+  total_ = 0;
+  start_time_ = 0;
+
+  if( airspyhf_open(&device_) != AIRSPYHF_SUCCESS ) {
+    fprintf(stderr, "airspyhf_open() failed\n");
+    exit(1);
+  }
+
+  if (airspyhf_set_samplerate(device_, air_rate_) != AIRSPYHF_SUCCESS) {
+    fprintf(stderr, "airspyhf_set_samplerate(%d) failed\n", air_rate_);
+    exit(1);
+  }
+
+  // allocate a 30-second circular buffer
+  n_ = rate_ * 30;
+  buf_ = (std::complex<double> *) malloc(sizeof(std::complex<double>) * n_);
+  assert(buf_);
+  wi_ = 0;
+  ri_ = 0;
+  time_ = -1;
+
+  // Liquid DSP filter + resampler to convert 192000 to 12000.
+  // firdecim?
+  // iirdecim?
+  // msresamp?
+  // msresamp2?
+  // resamp?
+  // resamp2?
+  int h_len = estimate_req_filter_len(0.01, 60.0);
+  float h[h_len];
+  double cutoff = (rate_ / (double) air_rate_) / 2.0;
+  liquid_firdes_kaiser(h_len,
+                       cutoff,
+                       60.0,
+                       0.0,
+                       h);
+  assert((air_rate_ % rate_) == 0);
+  filter_ = firfilt_crcf_create(h, h_len);
+}
+
+void
+AirspySoundIn::start()
+{
+  if( airspyhf_start(device_, cb1, this) != AIRSPYHF_SUCCESS ) {
+    fprintf(stderr, "airspyhf_start() failed.\n");
+    exit(1);
+  }
+
+  if( airspyhf_set_freq(device_, hz_) != AIRSPYHF_SUCCESS ) {
+    fprintf(stderr, "airspyhf_set_freq(%d) failed.\n", hz_);
+    exit(1);
+  }
+}
+
+int
+AirspySoundIn::cb1(airspyhf_transfer_t *transfer)
+{
+  AirspySoundIn *sin = (AirspySoundIn *) transfer->ctx;
+  return sin->cb2(transfer);
+}
+
+int
+AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
+{
+  // transfer->sample_count
+  // transfer->samples
+  // transfer->ctx
+  // transfer->dropped_samples
+  // each sample is an I/Q pair of 32-bit floats
+  if(total_ == 0){
+    start_time_ = now() - (1.0 / air_rate_) * transfer->sample_count;
+  }
+
+  if(transfer->dropped_samples){
+    fprintf(stderr, "dropped_samples %d\n", (int)transfer->dropped_samples);
+  }
+
+  // I/Q
+  // low-pass-filter
+  //   maybe this: https://liquidsdr.org/doc/msresamp/
+
+  airspyhf_complex_float_t *buf = transfer->samples;
+  for(int i = 0; i < transfer->sample_count; i++){
+    // low-pass filter, preparatory to rate reduction.
+    liquid_float_complex x, y;
+    x.real = buf[i].re;
+    x.imag = buf[i].im;
+    firfilt_crcf_push(filter_, x);
+    firfilt_crcf_execute(filter_, &y);
+
+    if((total_ % (air_rate_ / rate_)) == 0){
+      if(((wi_ + 1) % n_) != ri_){
+        // XXX what is the range of buf[i].re? 0..1?
+        buf_[wi_] = std::complex<double>(y.real, y.imag);
+        wi_ = (wi_ + 1) % n_;
+      } else {
+        fprintf(stderr, "CardSoundIn::cb buf_ overflow\n");
+        exit(1); // XXX
+        break;
+      }
+    }
+    total_ += 1;
+  }
+
+  time_ = start_time_ + total_ * (1.0 / air_rate_);
+
+  return 0;
+}
+
+std::vector<double>
+vreal(std::vector<std::complex<double>> a)
+{
+  std::vector<double> b(a.size());
+  for(int i = 0; i < a.size(); i++){
+    b[i] = a[i].real();
+  }
+  return b;
+}
+
+std::vector<double>
+vimag(std::vector<std::complex<double>> a)
+{
+  std::vector<double> b(a.size());
+  for(int i = 0; i < a.size(); i++){
+    b[i] = a[i].imag();
+  }
+  return b;
+}
+
+//
+// convert I/Q to USB via the phasing method.
+// uses FFTs over the whole of a[], so it's slow.
+// and the results are crummy at the start and end.
+//
+std::vector<double>
+iq2usb(std::vector<std::complex<double>> a)
+{
+  std::vector<double> ii = vreal(analytic(vreal(a)));
+  std::vector<double> qq = vimag(analytic(vimag(a)));
+  std::vector<double> ssb(ii.size());
+  for(int i = 0; i < ii.size(); i++){
+    ssb[i] = ii[i] - qq[i];
+  }
+  return ssb;
+}
+
+std::vector<double>
+AirspySoundIn::get(int n, double &t0)
+{
+  std::vector<double> nothing;
+
+  if(time_ < 0 && wi_ == ri_){
+    // no input has ever arrived.
+    t0 = -1;
+    return nothing;
+  }
+
+  // calculate time of first sample in buf_.
+  // XXX there's a race here with cb().
+  t0 = time_; // time of last sample in buf_.
+  if(wi_ > ri_){
+    t0 -= (wi_ - ri_) * (1.0 / rate_);
+  } else {
+    t0 -= ((wi_ + n_) - ri_) * (1.0 / rate_);
+  }
+
+  std::vector<std::complex<double>> v1;
+  while(v1.size() < n){
+    if(ri_ == wi_){
+      break;
+    }
+    v1.push_back(buf_[ri_]);
+    ri_ = (ri_ + 1) % n_;
+  }
+
+  if(v1.size() == 0){
+    return nothing;
+  } else {
+    std::vector<double> v2 = iq2usb(v1);
+    return v2;
+  }
+}
+#endif
+
 SoundOut::SoundOut(int card)
 {
   card_ = card;
@@ -269,7 +511,8 @@ SoundOut::start()
   op.device = card_;
   op.channelCount = 1;
   op.sampleFormat = paInt16;
-  op.suggestedLatency = 0.1; // avoid output glitches due to underflow.
+  // latency must be the same as for input card.
+  op.suggestedLatency = Pa_GetDeviceInfo(card_)->defaultLowInputLatency;
   op.hostApiSpecificStreamInfo = 0;
   
   str_ = 0;
@@ -307,4 +550,17 @@ SoundOut::write(const std::vector<short int> &v)
     fprintf(stderr, "Pa_WriteStream failed %d %s\n", err, Pa_GetErrorText(err));
     exit(1);
   }
+}
+
+void
+SoundOut::write(const std::vector<double> &v)
+{
+  std::vector<short int> vv(v.size());
+  for(int i = 0; i < v.size(); i++){
+    if(v[i] > 1.0){
+      fprintf(stderr, "SoundOut::write() oops %f\n", v[i]);
+    }
+    vv[i] = v[i] * 16380;
+  }
+  write(vv);
 }

@@ -116,3 +116,4 @@ goertzel(std::vector<double> v, int rate, int i0, int n, double hz)
 
   return std::complex<double>(re, im);
 }
+

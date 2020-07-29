@@ -13,7 +13,7 @@ To compile:
 To get a list of sound card numbers:
 
 ```
-  ./ft8mon
+  ./ft8mon -list
 ```
 
 To listen to sound card X, left channel:
@@ -40,6 +40,10 @@ To read input from a recorded WAV file:
 ```
   ./ft8mon -file xxx.wav
 ```
+
+If you have an Airspy HF+ Discovery, and you install the airspyhf and
+liquid dsp libraries, you can uncomment the relevant lines in the
+Makefile.
 
 Robert Morris,
 AB1HL

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <atomic>
 #include "util.h"
+#include "fft.h"
 
 // 1920-point FFT at 12000 samples/second
 // 6.25 Hz spacing, 0.16 seconds/symbol
@@ -77,9 +78,6 @@ double nyquist = 0.85;
 int oddrate = 1;
 double reduce_slop = 6.25;
 double pass0_frac = 1.0;
-int fftw_type = FFTW_MEASURE;
-
-typedef std::vector< std::vector< std::complex<double> > > ffts_t;
 
 typedef int (*cb_t)(int *a91, double hz0, double hz1, double off,
                     const char *, double snr);
@@ -346,30 +344,6 @@ double apriori174[] = {
   0.47, 0.50, 0.48, 0.50, 0.49, 0.51, 0.51, 0.51, 0.49,
 };
 
-// a cached fftw plan, for both of:
-// fftw_plan_dft_r2c_1d(n, m_in, m_out, FFTW_ESTIMATE);
-// fftw_plan_dft_c2r_1d(n, m_in, m_out, FFTW_ESTIMATE);
-class Plan {
-public:
-  int n_;
-
-  //
-  // real -> complex
-  //
-  fftw_complex *c_; // (n_ / 2) + 1 of these
-  double *r_; // n_ of these
-  fftw_plan fwd_; // forward plan
-  fftw_plan rev_; // reverse plan
-
-  //
-  // complex -> complex
-  //
-  fftw_complex *cc1_; // n
-  fftw_complex *cc2_; // n
-  fftw_plan cfwd_; // forward plan
-  fftw_plan crev_; // reverse plan
-};
-
 class FT8 {
 public:
   std::thread *th_;
@@ -390,10 +364,6 @@ public:
 
   static std::mutex cb_mu_;
   cb_t cb_; // call-back into Python
-
-  static std::mutex plans_mu_;
-  static std::vector<Plan> plans_;
-  static int plan_master_pid_;
 
   std::mutex hack_mu_;
   int hack_size_;
@@ -438,374 +408,6 @@ public:
   ~FT8() {
   }
 
-  void get_plan(int n, Plan &p) {
-    // try to cache fftw plans in the parent process,
-    // so they will already be there for fork()ed children.
-
-    plans_mu_.lock();
-
-    if(plan_master_pid_ < 0){
-      plan_master_pid_ = getpid();
-    }
-    
-    for(int i = 0; i < plans_.size(); i++){
-      if(plans_[i].n_ == n){
-        p = plans_[i];
-        plans_mu_.unlock();
-        return;
-      }
-    }
-
-    double t0 = now();
-
-    //
-    // real -> complex
-    //
-    
-    p.n_ = n;
-    p.r_ = (double*) fftw_malloc(n * sizeof(double));
-    assert(p.r_);
-    p.c_ = (fftw_complex*) fftw_malloc(((n/2)+1) * sizeof(fftw_complex));
-    assert(p.c_);
-
-    // FFTW_ESTIMATE
-    // FFTW_MEASURE
-    // FFTW_PATIENT
-    // FFTW_EXHAUSTIVE
-    int type = fftw_type;
-    if(getpid() != plan_master_pid_){
-      type = FFTW_ESTIMATE;
-    }
-    p.fwd_ = fftw_plan_dft_r2c_1d(n, p.r_, p.c_, type);
-    assert(p.fwd_);
-    p.rev_ = fftw_plan_dft_c2r_1d(n, p.c_, p.r_, type);
-    assert(p.rev_);
-
-    //
-    // complex -> complex
-    //
-    p.cc1_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
-    assert(p.cc1_);
-    p.cc2_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
-    assert(p.cc2_);
-    p.cfwd_ = fftw_plan_dft_1d(n, p.cc1_, p.cc2_, FFTW_FORWARD, type);
-    assert(p.cfwd_);
-    p.crev_ = fftw_plan_dft_1d(n, p.cc2_, p.cc1_, FFTW_BACKWARD, type);
-    assert(p.crev_);
-
-    double t1 = now();
-    //fprintf(stderr, "miss pid=%d n=%d t=%.3f\n", getpid(), n, t1-t0);
-
-    plans_.push_back(p);
-
-    plans_mu_.unlock();
-  }
-
-//
-// do a full set of FFTs, one per symbol-time.
-// bins[time][frequency]
-//
-ffts_t
-ffts(const std::vector<double> &samples, int i0, int block, int use_window)
-{
-  assert(i0 >= 0);
-  assert(block > 1 && (block % 2) == 0);
-  
-  int nsamples = samples.size();
-  int nbins = (block / 2) + 1;
-  int nblocks = (nsamples - i0) / block;
-  ffts_t bins(nblocks);
-  for(int si = 0; si < nblocks; si++){
-    bins[si].resize(nbins);
-  }
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.fwd_;
-
-  // allocate our own b/c using p.m_in and p.m_out isn't thread-safe.
-  double *m_in = (double *) fftw_malloc(sizeof(double) * p.n_);
-  fftw_complex *m_out = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                     ((p.n_ / 2) + 1));
-  assert(m_in && m_out);
-
-  // double *m_in = p.r_;
-  // fftw_complex *m_out = p.c_;
-
-  std::vector<double> win;
-  if(use_window)
-    win = hamming(block);
-
-  for(int si = 0; si < nblocks; si++){
-    int off = i0 + si * block;
-    for(int i = 0; i < block; i++){
-      if(off + i < nsamples){
-        double x = samples[off + i];
-        if(use_window)
-          x *= win[i];
-        m_in[i] = x;
-      } else {
-        m_in[i] = 0;
-      }
-    }
-
-    fftw_execute_dft_r2c(m_plan, m_in, m_out);
-
-    for(int bi = 0; bi < nbins; bi++){
-      double re = m_out[bi][0];
-      double im = m_out[bi][1];
-      std::complex<double> c(re, im);
-      bins[si][bi] = c;
-    }
-  }
-
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return bins;
-}
-
-//
-// do just one FFT on samples[i0..i0+block]
-// real inputs, complex outputs.
-// output has (block / 2) + 1 points.
-//
-std::vector<std::complex<double>>
-one_fft(const std::vector<double> &samples, int i0, int block,
-        int use_window)
-{
-  assert(i0 >= 0);
-  assert(block > 1);
-  
-  int nsamples = samples.size();
-  int nbins = (block / 2) + 1;
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.fwd_;
-
-  double *m_in = (double *) fftw_malloc(sizeof(double) * p.n_);
-  fftw_complex *m_out = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                     ((p.n_ / 2) + 1));
-
-  std::vector<double> win;
-  if(use_window)
-    win = hamming(block);
-
-  for(int i = 0; i < block; i++){
-    if(i0 + i < nsamples){
-      double x = samples[i0 + i];
-      if(use_window)
-        x *= win[i];
-      m_in[i] = x;
-    } else {
-      m_in[i] = 0;
-    }
-  }
-
-  fftw_execute_dft_r2c(m_plan, m_in, m_out);
-
-  std::vector<std::complex<double>> out(nbins);
-
-  for(int bi = 0; bi < nbins; bi++){
-    double re = m_out[bi][0];
-    double im = m_out[bi][1];
-    std::complex<double> c(re, im);
-    out[bi] = c;
-  }
-
-  fftw_free(m_in);
-  fftw_free(m_out);
-    
-  return out;
-}
-
-//
-// do just one FFT on samples[i0..i0+block]
-// real inputs, complex outputs.
-// output has block points.
-//
-std::vector<std::complex<double>>
-one_fft_c(const std::vector<double> &samples, int i0, int block)
-{
-  assert(i0 >= 0);
-  assert(block > 1);
-  
-  int nsamples = samples.size();
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.cfwd_;
-
-  fftw_complex *m_in  = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
-  fftw_complex *m_out = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
-  assert(m_in && m_out);
-
-  for(int i = 0; i < block; i++){
-    if(i0 + i < nsamples){
-      m_in[i][0] = samples[i0 + i]; // real
-    } else {
-      m_in[i][0] = 0;
-    }
-    m_in[i][1] = 0; // imaginary
-  }
-
-  fftw_execute_dft(m_plan, m_in, m_out);
-
-  std::vector<std::complex<double>> out(block);
-
-  double norm = 1.0 / sqrt(block);
-  for(int bi = 0; bi < block; bi++){
-    double re = m_out[bi][0];
-    double im = m_out[bi][1];
-    std::complex<double> c(re, im);
-    c *= norm;
-    out[bi] = c;
-  }
-    
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return out;
-}
-
-std::vector<double>
-one_ifft(const std::vector<std::complex<double>> &bins)
-{
-  int nbins = bins.size();
-  int block = (nbins - 1) * 2;
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.rev_;
-
-  fftw_complex *m_in = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                    ((p.n_ / 2) + 1));
-  double *m_out = (double *) fftw_malloc(sizeof(double) * p.n_);
-
-  for(int bi = 0; bi < nbins; bi++){
-    double re = bins[bi].real();
-    double im = bins[bi].imag();
-    m_in[bi][0] = re;
-    m_in[bi][1] = im;
-  }
-
-  fftw_execute_dft_c2r(m_plan, m_in, m_out);
-
-  std::vector<double> out(block);
-  for(int i = 0; i < block; i++){
-    out[i] = m_out[i];
-  }
-
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return out;
-}
-
-std::vector<std::complex<double>>
-one_ifft_cc(const std::vector<std::complex<double>> &bins)
-{
-  int block = bins.size();
-
-  Plan p;
-  get_plan(block, p);
-  fftw_plan m_plan = p.crev_;
-
-  fftw_complex *m_in = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
-  fftw_complex *m_out = (fftw_complex *) fftw_malloc(block * sizeof(fftw_complex));
-  assert(m_in && m_out);
-
-  for(int bi = 0; bi < block; bi++){
-    double re = bins[bi].real();
-    double im = bins[bi].imag();
-    m_in[bi][0] = re;
-    m_in[bi][1] = im;
-  }
-
-  fftw_execute_dft(m_plan, m_in, m_out);
-
-  std::vector<std::complex<double>> out(block);
-  double norm = 1.0 / sqrt(block);
-  for(int i = 0; i < block; i++){
-    double re = m_out[i][0];
-    double im = m_out[i][1];
-    std::complex<double> c(re, im);
-    c *= norm;
-    out[i] = c;
-  }
-
-  fftw_free(m_in);
-  fftw_free(m_out);
-
-  return out;
-}
-
-//
-// return the analytic signal for signal x,
-// just like scipy.signal.hilbert(), from which
-// this code is copied.
-//
-// the return value is x + iy, where y is the hilbert transform of x.
-//
-std::vector<std::complex<double>>
-analytic(const std::vector<double> &x)
-{
-  int n = x.size();
-
-  std::vector<std::complex<double>> y = one_fft_c(x, 0, n);
-  assert(y.size() == n);
-
-  // leave y[0] alone.
-  // double the first (positive) half of the spectrum.
-  // zero out the second (negative) half of the spectrum.
-  // y[n/2] is the nyquist bucket if n is even; leave it alone.
-  if((n % 2) == 0){
-    for(int i = 1; i < n/2; i++)
-      y[i] *= 2;
-    for(int i = n/2+1; i < n; i++)
-      y[i] = 0;
-  } else {
-    for(int i = 1; i < (n+1)/2; i++)
-      y[i] *= 2;
-    for(int i = (n+1)/2; i < n; i++)
-      y[i] = 0;
-  }
-      
-  std::vector<std::complex<double>> z = one_ifft_cc(y);
-
-  return z;
-}
-
-//
-// general-purpose shift x in frequency by hz.
-// uses hilbert transform to avoid sidebands.
-// but it does wrap around at 0 hz and the nyquist frequency.
-//
-// note analytic() does an FFT over the whole signal, which
-// is expensive, and often re-used, but it turns out it
-// isn't a big factor in overall run-time.
-//
-std::vector<double>
-hilbert_shift(const std::vector<double> &x, double hz0, double hz1, int rate)
-{
-  std::vector<std::complex<double>> y = analytic(x);
-  assert(y.size() == x.size());
-
-  double dt = 1.0 / rate;
-  int n = x.size();
-
-  std::vector<double> ret(n);
-  
-  for(int i = 0; i < n; i++){
-    // complex "local oscillator" at hz.
-    double hz = hz0 + (i / (double)n) * (hz1 - hz0);
-    std::complex<double> lo = std::exp(std::complex<double>(0.0, 2 * M_PI * hz * dt * i));
-    ret[i] = (lo * y[i]).real();
-  }
-
-  return ret;
-}
 
 // strength of costas block of signal with tone 0 at bi0,
 // and symbol zero at si0.
@@ -955,7 +557,7 @@ reduce_rate(const std::vector<double> &a, double hz0, double hz1,
   assert(hz1 - hz0 <= brate / 2);
 
   int len = a.size();
-  std::vector<std::complex<double>> bins = one_fft(a, 0, len, 0);
+  std::vector<std::complex<double>> bins = one_fft(a, 0, len);
   int nbins = bins.size();
   double bin_hz = arate / (double) len;
 
@@ -1083,7 +685,7 @@ go()
       
       for(int off_frac_i = 0; off_frac_i < coarse_off_fracs; off_frac_i++){
         int off_frac = off_frac_i * (block / coarse_off_fracs);
-        ffts_t bins = ffts(samples1, off_frac, block, 0);
+        ffts_t bins = ffts(samples1, off_frac, block);
         std::vector<Strength> oo = coarse(bins, si0, si1);
         for(int i = 0; i < oo.size(); i++){
           oo[i].hz_ += hz_frac;
@@ -1141,9 +743,9 @@ one_strength(const std::vector<double> &samples200, double hz, int off)
 
   double sum = 0;
   for(int si = 0; si < 7; si++){
-    auto fft1 = one_fft(samples200, off+(si+0)*32, 32, 0);
-    auto fft2 = one_fft(samples200, off+(si+36)*32, 32, 0);
-    auto fft3 = one_fft(samples200, off+(si+72)*32, 32, 0);
+    auto fft1 = one_fft(samples200, off+(si+0)*32, 32);
+    auto fft2 = one_fft(samples200, off+(si+36)*32, 32);
+    auto fft3 = one_fft(samples200, off+(si+72)*32, 32);
     for(int bi = 0; bi < 8; bi++){
       double x = 0;
       x += std::abs(fft1[bin0+bi]);
@@ -1176,7 +778,7 @@ one_strength_known(const std::vector<double> &samples200,
 
   double sum = 0;
   for(int si = 0; si < 79; si++){
-    auto fft1 = one_fft(samples200, off+si*32, 32, 0);
+    auto fft1 = one_fft(samples200, off+si*32, 32);
     for(int bi = 0; bi < 8; bi++){
       double x = std::abs(fft1[bin0+bi]);
       if(bi == syms[si]){
@@ -1352,7 +954,7 @@ fft_shift(const std::vector<double> &samples, int off, int len,
           int rate, double hz)
 {
 #if 0
-  std::vector<std::complex<double>> bins = one_fft(samples, off, len, 0);
+  std::vector<std::complex<double>> bins = one_fft(samples, off, len);
 #else
   // horrible hack to avoid repeated FFTs on the same input.
   hack_mu_.lock();
@@ -1362,7 +964,7 @@ fft_shift(const std::vector<double> &samples, int off, int len,
      samples[0] == hack_0_ && samples[1] == hack_1_){
     bins = hack_bins_;
   } else {
-    bins = one_fft(samples, off, len, 0);
+    bins = one_fft(samples, off, len);
     hack_bins_ = bins;
     hack_size_ = samples.size();
     hack_off_ = off;
@@ -1412,7 +1014,7 @@ extract(const std::vector<double> &samples200, double hz, int off, int factor)
   std::vector<double> downsamples200 = shift200(samples200, 0,
                                                 samples200.size(), hz);
 
-  ffts_t bins3 = ffts(downsamples200, off, 32, 0);
+  ffts_t bins3 = ffts(downsamples200, off, 32);
 
   ffts_t m79(79);
   for(int si = 0; si < 79; si++){
@@ -1827,7 +1429,7 @@ std::vector<double>
 down_v7(const std::vector<double> &samples, double hz)
 {
   int len = samples.size();
-  std::vector<std::complex<double>> bins = one_fft(samples, 0, len, 0);
+  std::vector<std::complex<double>> bins = one_fft(samples, 0, len);
   int nbins = bins.size();
 
   double bin_hz = rate_ / (double) len;
@@ -2155,7 +1757,7 @@ subtract(const std::vector<int> re79,
   double diff1 = (bin0 * bin_hz) - hz1;
   std::vector<double> moved = hilbert_shift(nsamples_, diff0, diff1, rate_);
 
-  ffts_t bins = ffts(moved, off0, block, 0);
+  ffts_t bins = ffts(moved, off0, block);
 
   if(bin0 + 8 > bins[0].size())
     return;
@@ -2315,9 +1917,6 @@ recode(int a174[])
 
 };
 
-std::vector<Plan> FT8::plans_;
-int FT8::plan_master_pid_ = -1;
-std::mutex FT8::plans_mu_;
 std::mutex FT8::cb_mu_;
 
 extern "C" {
