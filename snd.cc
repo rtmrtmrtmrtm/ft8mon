@@ -480,8 +480,9 @@ AirspySoundIn::get(int n, double &t0)
     ri_ = (ri_ + 1) % n_;
   }
 
-  if(v1.size() == 0){
-    return nothing;
+  if(v1.size() < 2){
+    // analytic() demands more than one sample.
+    return vreal(v1);
   } else {
     std::vector<double> v2 = iq2usb(v1);
     return v2;
