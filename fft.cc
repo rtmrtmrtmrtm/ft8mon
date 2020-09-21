@@ -3,6 +3,9 @@
 #include <mutex>
 #include <unistd.h>
 #include <assert.h>
+#include <sys/file.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "util.h"
 
 int fftw_type = FFTW_MEASURE;
@@ -33,17 +36,17 @@ public:
 
 static std::mutex plansmu;
 static std::vector<Plan> plans;
-static int plan_master_pid;
+static int plan_master_pid = 0;
 
 void
-get_plan(int n, Plan &p)
+get_plan(int n, Plan &p, const char *why)
 {
   // cache fftw plans in the parent process,
   // so they will already be there for fork()ed children.
   
   plansmu.lock();
   
-  if(plan_master_pid < 0){
+  if(plan_master_pid == 0){
     plan_master_pid = getpid();
   }
     
@@ -54,7 +57,21 @@ get_plan(int n, Plan &p)
       return;
     }
   }
-  
+
+  double t0 = now();
+
+  // fftw_make_planner_thread_safe();
+
+  // the fftw planner is not thread-safe.
+  // can't rely on plansmu because both ft8.so
+  // and snd.so may be using separate copies of fft.cc.
+  // the lock file really should be per process.
+  int lockfd = creat("/tmp/fft-plan-lock", 0666);
+  assert(lockfd >= 0);
+  fchmod(lockfd, 0666);
+  int lockret = flock(lockfd, LOCK_EX);
+  assert(lockret == 0);
+
   //
   // real -> complex
   //
@@ -90,7 +107,16 @@ get_plan(int n, Plan &p)
   p.crev_ = fftw_plan_dft_1d(n, p.cc2_, p.cc1_, FFTW_BACKWARD, type);
   assert(p.crev_);
 
+  flock(lockfd, LOCK_UN);
+  close(lockfd);
+
   plans.push_back(p);
+
+  if(0){
+    double t1 = now();
+    fprintf(stderr, "miss pid=%d master=%d n=%d t=%.3f, %s\n",
+            getpid(), plan_master_pid, n, t1 - t0, why);
+  }
 
   plansmu.unlock();
 }
@@ -101,7 +127,7 @@ get_plan(int n, Plan &p)
 // output has (block / 2) + 1 points.
 //
 std::vector<std::complex<double>>
-one_fft(const std::vector<double> &samples, int i0, int block)
+one_fft(const std::vector<double> &samples, int i0, int block, const char *why)
 {
   assert(i0 >= 0);
   assert(block > 1);
@@ -110,7 +136,7 @@ one_fft(const std::vector<double> &samples, int i0, int block)
   int nbins = (block / 2) + 1;
 
   Plan p;
-  get_plan(block, p);
+  get_plan(block, p, why);
   fftw_plan m_plan = p.fwd_;
 
   double *m_in = (double *) fftw_malloc(sizeof(double) * p.n_);
@@ -149,7 +175,7 @@ one_fft(const std::vector<double> &samples, int i0, int block)
 // bins[time][frequency]
 //
 ffts_t
-ffts(const std::vector<double> &samples, int i0, int block)
+ffts(const std::vector<double> &samples, int i0, int block, const char *why)
 {
   assert(i0 >= 0);
   assert(block > 1 && (block % 2) == 0);
@@ -163,7 +189,7 @@ ffts(const std::vector<double> &samples, int i0, int block)
   }
 
   Plan p;
-  get_plan(block, p);
+  get_plan(block, p, why);
   fftw_plan m_plan = p.fwd_;
 
   // allocate our own b/c using p.m_in and p.m_out isn't thread-safe.
@@ -208,7 +234,7 @@ ffts(const std::vector<double> &samples, int i0, int block)
 // output has block points.
 //
 std::vector<std::complex<double>>
-one_fft_c(const std::vector<double> &samples, int i0, int block)
+one_fft_c(const std::vector<double> &samples, int i0, int block, const char *why)
 {
   assert(i0 >= 0);
   assert(block > 1);
@@ -216,7 +242,7 @@ one_fft_c(const std::vector<double> &samples, int i0, int block)
   int nsamples = samples.size();
 
   Plan p;
-  get_plan(block, p);
+  get_plan(block, p, why);
   fftw_plan m_plan = p.cfwd_;
 
   fftw_complex *m_in  = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
@@ -252,12 +278,12 @@ one_fft_c(const std::vector<double> &samples, int i0, int block)
 }
 
 std::vector<std::complex<double>>
-one_ifft_cc(const std::vector<std::complex<double>> &bins)
+one_ifft_cc(const std::vector<std::complex<double>> &bins, const char *why)
 {
   int block = bins.size();
 
   Plan p;
-  get_plan(block, p);
+  get_plan(block, p, why);
   fftw_plan m_plan = p.crev_;
 
   fftw_complex *m_in = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
@@ -290,13 +316,13 @@ one_ifft_cc(const std::vector<std::complex<double>> &bins)
 }
 
 std::vector<double>
-one_ifft(const std::vector<std::complex<double>> &bins)
+one_ifft(const std::vector<std::complex<double>> &bins, const char *why)
 {
   int nbins = bins.size();
   int block = (nbins - 1) * 2;
 
   Plan p;
-  get_plan(block, p);
+  get_plan(block, p, why);
   fftw_plan m_plan = p.rev_;
 
   fftw_complex *m_in = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
@@ -331,11 +357,11 @@ one_ifft(const std::vector<std::complex<double>> &bins)
 // the return value is x + iy, where y is the hilbert transform of x.
 //
 std::vector<std::complex<double>>
-analytic(const std::vector<double> &x)
+analytic(const std::vector<double> &x, const char *why)
 {
   ulong n = x.size();
 
-  std::vector<std::complex<double>> y = one_fft_c(x, 0, n);
+  std::vector<std::complex<double>> y = one_fft_c(x, 0, n, why);
   assert(y.size() == n);
 
   // leave y[0] alone.
@@ -354,7 +380,7 @@ analytic(const std::vector<double> &x)
       y[i] = 0;
   }
       
-  std::vector<std::complex<double>> z = one_ifft_cc(y);
+  std::vector<std::complex<double>> z = one_ifft_cc(y, why);
 
   return z;
 }
@@ -374,7 +400,7 @@ std::vector<double>
 hilbert_shift(const std::vector<double> &x, double hz0, double hz1, int rate)
 {
   // y = scipy.signal.hilbert(x)
-  std::vector<std::complex<double>> y = analytic(x);
+  std::vector<std::complex<double>> y = analytic(x, "hilbert_shift");
   assert(y.size() == x.size());
 
   double dt = 1.0 / rate;
