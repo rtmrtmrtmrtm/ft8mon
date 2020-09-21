@@ -22,8 +22,12 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <random>
+#include <functional>
+#include <map>
 #include "util.h"
 #include "fft.h"
+#include "ft8.h"
 
 // 1920-point FFT at 12000 samples/second
 // 6.25 Hz spacing, 0.16 seconds/symbol
@@ -46,14 +50,14 @@ int snr_win = 5; // averaging window, in symbols, for SNR conversion
 int snr_how = 0; // technique to measure "N" for SNR. 0 means median of the 8 tones.
 int soft_ranges = 1;
 int best_in_noise = 1;
-double shoulder = 10; // for bandpass filter
-double shoulder_extra = 0.0; // for bandpass filter
-double second_hz_inc = 1.2; // second search_both()
-double second_hz_win = 2.7;
-double second_off_inc = 0.2;
-double second_off_win = 0.7; // search window in symbol-times
+double shoulder200 = 10; // for 200 sps bandpass filter
+double shoulder200_extra = 0.0; // for bandpass filter
+double second_hz_win = 3.5; // +/- hz
+int second_hz_fracs = 7; // divide total window into this many pieces
+double second_off_win = 0.7; // +/- search window in symbol-times
+int second_off_fracs = 7;
 double third_hz_inc = 6.25 / 32;
-double third_hz_win = 6.25 / 2;
+double third_hz_win = 1;
 int third_off_inc = 1;
 int third_off_win = 16;
 double log_tail = 0.1;
@@ -68,19 +72,27 @@ int osd_ldpc_thresh = 70; // demand this many correct LDPC parity bits for OSD
 int ncoarse = 1; // number of offsets per hz produced by coarse()
 int ncoarse_blocks = 1;
 double tminus = 2.2; // start looking at 0.5 - tminus seconds
-double tplus = 2.7;
+double tplus = 2.4;
 int coarse_off_fracs = 4;
-int coarse_hz_fracs = 4;
+int coarse_hz_fracs = 5;
 double already_hz = 27;
-double overlap = 0;
+double overlap = 20;
+int overlap_edges = 0;
 int sub_amp_win = 0;
-double nyquist = 0.85;
+double nyquist = 0.95;
 int oddrate = 1;
-double reduce_slop = 6.25;
 double pass0_frac = 1.0;
-
-typedef int (*cb_t)(int *a91, double hz0, double hz1, double off,
-                    const char *, double snr);
+int reduce_len = 5;
+int reduce_how = 2;
+double go_extra = 3.1;
+double reduce_margin = 0.06;
+int do_reduce = 1;
+int pass_threshold = 1;
+int strength_how = 1;
+int coarse_strength_how = 6;
+double reduce_shoulder = -1;
+double coarse_all = -1;
+int second_count = 2;
 
 //
 // return a Hamming window of length n.
@@ -419,27 +431,72 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
   assert(si0 >= 0 && si0+72+8 <= bins.size());
   assert(bi0 >= 0 && bi0 + 8 <= bins[0].size());
 
-  double signal = 0.0;
+  double sig = 0.0;
   double noise = 0.0;
 
-  for(int si = 0; si < 7; si++){
-    for(int bi = 0; bi < 8; bi++){
-      double x = 0;
-      x += std::abs(bins[si0+si][bi0+bi]);
-      x += std::abs(bins[si0+36+si][bi0+bi]);
-      x += std::abs(bins[si0+72+si][bi0+bi]);
-      if(bi == costas[si]){
-        signal += x;
+  if(coarse_all >= 0){
+    for(int si = 0; si < 79; si++){
+      double mx;
+      int mxi = -1;
+      double sum = 0;
+      for(int i = 0; i < 8; i++){
+        double x = std::abs(bins[si0+si][bi0+i]);
+        sum += x;
+        if(mxi < 0 || x > mx){
+          mxi = i;
+          mx = x;
+        }
+      }
+      if(si >= 0 && si < 7){
+        double x = std::abs(bins[si0+si][bi0+costas[si-0]]);
+        sig += x;
+        noise += sum - x;
+      } else if(si >= 36 && si < 36+7){
+        double x = std::abs(bins[si0+si][bi0+costas[si-36]]);
+        sig += x;
+        noise += sum - x;
+      } else if(si >= 72 && si < 72+7){
+        double x = std::abs(bins[si0+si][bi0+costas[si-72]]);
+        sig += x;
+        noise += sum - x;
       } else {
-        noise += x;
+        sig += coarse_all * mx;
+        noise += coarse_all * (sum - mx);
+      }
+    }
+  } else {
+    // just costas symbols
+    for(int si = 0; si < 7; si++){
+      for(int bi = 0; bi < 8; bi++){
+        double x = 0;
+        x += std::abs(bins[si0+si][bi0+bi]);
+        x += std::abs(bins[si0+36+si][bi0+bi]);
+        x += std::abs(bins[si0+72+si][bi0+bi]);
+        if(bi == costas[si]){
+          sig += x;
+        } else {
+          noise += x;
+        }
       }
     }
   }
 
-  if(noise == 0.0){
-    return 1.0;
+  if(coarse_strength_how == 0){
+     return sig - noise;
+  } else if(coarse_strength_how == 1){
+    return sig - noise/7;
+  } else if(coarse_strength_how == 2){
+    return sig / (noise/7);
+  } else if(coarse_strength_how == 3){
+    return sig / (sig + (noise/7));
+  } else if(coarse_strength_how == 4){
+    return sig;
+  } else if(coarse_strength_how == 5){
+    return sig / (sig + noise);
+  } else if(coarse_strength_how == 6){
+    return sig / noise;
   } else {
-    return signal / noise;
+    assert(0);
   }
 }
 
@@ -500,73 +557,53 @@ coarse(const ffts_t &bins, int si0, int si1)
 }
 
 //
-// change the sample rate rate.
-// interpolates if brate doesn't divide arate.
-// caller must have low-passed filtered.
-//
-std::vector<double>
-resample(const std::vector<double> &a, int arate, int brate)
-{
-  assert(brate <= arate);
-  if(arate == brate)
-    return a;
-
-  int alen = a.size();
-  double ratio = brate / (double) arate;
-  int blen = round(alen * ratio);
-  std::vector<double> b(blen);
-
-  if((arate % brate) == 0){
-    int inc = arate / brate;
-    for(int i = 0; i < blen; i++){
-      if(i * inc < alen){
-        b[i] = a[i * inc];
-      } else {
-        b[i] = 0;
-      }
-    }
-  } else {
-    for(int i = 0; i < blen; i++){
-      double jj = i / ratio;
-      int j0 = jj;
-      int j1 = j0 + 1;
-      if(j1 >= alen){
-        b[i] = 0;
-      } else {
-        double y = 0;
-        y += a[j0] * (1.0 - (jj - j0));
-        y += a[j1] * (jj - j0);
-        b[i] = y;
-      }
-    }
-  }
-  return b;
-}
-
-//
-// bandpass to hz0 .. hz1.
 // reduce the sample rate from arate to brate.
+// center hz0..hz1 in the new nyquist range.
+// but first filter to that range.
 // sets delta_hz to hz moved down.
 //
 std::vector<double>
-reduce_rate(const std::vector<double> &a, double hz0, double hz1,
+reduce_rate(std::vector<double> a, double hz0, double hz1,
             int arate, int brate,
             double &delta_hz)
 {
   assert(brate < arate);
   assert(hz1 - hz0 <= brate / 2);
 
+  // the pass band is hz0..hz1
+  // stop bands are 0..hz00 and hz11..nyquist.
+  double hz00, hz11;
+
+  if(reduce_shoulder > 0){
+    hz00 = hz0 - reduce_shoulder;
+    hz11 = hz1 + reduce_shoulder;
+  } else {
+    double mid = (hz0 + hz1) / 2;
+    hz00 = mid - (brate / 4.0);
+    hz11 = mid + (brate / 4.0);
+  }
+
   int len = a.size();
-  std::vector<std::complex<double>> bins = one_fft(a, 0, len);
+  std::vector<std::complex<double>> bins = one_fft(a, 0, len, "reduce_rate");
   int nbins = bins.size();
   double bin_hz = arate / (double) len;
 
-  // band-pass filter the FFT output.
-  for(int i = 0; i < nbins; i++){
-    if(i < ((hz0 - reduce_slop) / bin_hz)){
-      bins[i] = 0;
-    } else if(i > ((hz1 + reduce_slop) / bin_hz)){
-      bins[i] = 0;
+  if(reduce_how == 2){
+    // band-pass filter the FFT output.
+    bins = fbandpass(bins, bin_hz,
+                     hz00,
+                     hz0,
+                     hz1,
+                     hz11);
+  }
+  
+  if(reduce_how == 3){
+    for(int i = 0; i < nbins; i++){
+      if(i < (hz0 / bin_hz)){
+        bins[i] = 0;
+      } else if(i > (hz1 / bin_hz)){
+        bins[i] = 0;
+      }
     }
   }
 
@@ -585,48 +622,54 @@ reduce_rate(const std::vector<double> &a, double hz0, double hz1,
     }
   }
 
-  // reconstruct at original rate.
-  std::vector<double> vv = one_ifft(bins);
-  
-  // re-sample to lower rate.
-  // with interpolation.
-  std::vector<double> vvv = resample(vv, rate_, brate);
+  // use ifft to reduce the rate.
+  int blen = round(a.size() * (brate / (double) arate));
+  std::vector<std::complex<double>> bbins(blen / 2 + 1);
+  for(int i = 0; i < bbins.size(); i++)
+    bbins[i] = bins[i];
+  std::vector<double> vvv = one_ifft(bbins, "reduce_rate");
 
   delta_hz = delta * bin_hz;
-  
+
   return vvv;
 }
 
 void
 go()
 {
+#if 0
+  fprintf(stderr, "go: %.0f .. %.0f, %.0f, rate=%d\n",
+          min_hz_, max_hz_, max_hz_ - min_hz_, rate_);
+#endif
+
   // can we reduce the sample rate?
-  double hzrange = (max_hz_ - min_hz_) + 50;
-  int rates[] = { 1000, 1500, 2000, 3000, 4000, 6000, -1 };
+  int rates[] = { 500, 1000, 1500, 2000, 3000, 4000, 6000, -1 };
   int nrate = -1;
   for(int ratei = 0; rates[ratei] > 0; ratei++){
     int xrate = rates[ratei];
-    if(oddrate || (rate_ % xrate) == 0){
-      if(hzrange < nyquist * (xrate / 2)){
+    if(xrate < rate_ && (oddrate || (rate_ % xrate) == 0)){
+      if(((max_hz_ - min_hz_) + 50 + 2*go_extra) < nyquist * (xrate / 2)){
         nrate = xrate;
         break;
       }
     }
   }
   
-  if(nrate > 0 && nrate != rate_){
+  if(do_reduce && nrate > 0 && nrate < rate_){
     // filter and reduce the sample rate from rate_ to nrate.
 
-    if(0){
-      fprintf(stderr, "%.0f..%.0f, range %.0f, rates %d %d\n",
-              min_hz_, max_hz_,
-              hzrange,
-              rate_, nrate);
-    }
-
     double delta_hz; // how much it moved down
-    samples_ = reduce_rate(samples_, min_hz_-3.1, max_hz_+50-3.1,
+    samples_ = reduce_rate(samples_,
+                           min_hz_-3.1-go_extra,
+                           max_hz_+50-3.1+go_extra,
                            rate_, nrate, delta_hz);
+
+    if(0){
+      fprintf(stderr, "%.0f..%.0f, range %.0f, rate %d -> %d, delta hz %.0f\n",
+              min_hz_, max_hz_,
+              max_hz_ - min_hz_,
+              rate_, nrate, delta_hz);
+    }
 
     if(delta_hz > 0){
       down_hz_ = delta_hz; // to adjust hz for Python.
@@ -641,18 +684,55 @@ go()
     start_ = round(start_ * ratio);
   }
   
-  // a copy from which to subtract.
-  nsamples_ = samples_;
-  
   // FT8 symbol length is 1920 at 12000 samples/second.
+  assert((12000 % rate_) == 0);
+  assert((1920 % (12000 / rate_)) == 0);
   int block = 1920 / (12000 / rate_);
   double bin_hz = rate_ / (double) block;
 
-  // start_ is 0.5 seconds, the nominal start time, typically start_=6000
+  // start_ is the sample number of 0.5 seconds, the nominal start time.
+
+#if 0
+  // make sure there's at least tminus*rate_ samples before start_.
+  // XXX this breaks reported offsets.
+  if(start_ < tminus*rate_){
+    int need = tminus*rate_ - start_;
+    fprintf(stderr, "*** prepending %d\n", need);
+    std::vector<double> v(need);
+    for(int i = 0; i < need; i++)
+      v[i] = 0;
+    samples_.insert(samples_.begin(), v.begin(), v.end());
+    start_ += need;
+  }
+#endif
+
+  // make sure there's at least tplus*rate_ samples after the end.
+  if(start_ + tplus*rate_ + 79 * block > samples_.size()){
+    int need = start_ + tplus*rate_ + 79 * block - samples_.size();
+
+    // round up to a whole second, to ease fft plan caching.
+    if((need % rate_) != 0)
+      need += rate_ - (need % rate_);
+
+    std::default_random_engine generator;
+    std::uniform_int_distribution<int> distribution(0, samples_.size()-1);
+    auto rnd = std::bind(distribution, generator);
+
+    std::vector<double> v(need);
+    for(int i = 0; i < need; i++){
+      //v[i] = 0;
+      v[i] = samples_[rnd()];
+    }
+    samples_.insert(samples_.end(), v.begin(), v.end());
+  }
+  
   int si0 = (start_ - tminus*rate_) / block;
   if(si0 < 0)
     si0 = 0;
   int si1 = (start_ + tplus*rate_) / block;
+  
+  // a copy from which to subtract.
+  nsamples_ = samples_;
 
   for(pass_ = 0; pass_ < npasses; pass_++){
     double total_remaining = deadline_ - now();
@@ -685,7 +765,7 @@ go()
       
       for(int off_frac_i = 0; off_frac_i < coarse_off_fracs; off_frac_i++){
         int off_frac = off_frac_i * (block / coarse_off_fracs);
-        ffts_t bins = ffts(samples1, off_frac, block);
+        ffts_t bins = ffts(samples1, off_frac, block, "go");
         std::vector<Strength> oo = coarse(bins, si0, si1);
         for(int i = 0; i < oo.size(); i++){
           oo[i].hz_ += hz_frac;
@@ -710,7 +790,7 @@ go()
       double tt = now();
       if(ii > 0 &&
          tt > deadline &&
-         (tt > deadline_ || new_decodes > 0) &&
+         (tt > deadline_ || new_decodes >= pass_threshold) &&
          (pass_ < npasses-1 || tt > final_deadline_)){
         break;
       }
@@ -741,24 +821,43 @@ one_strength(const std::vector<double> &samples200, double hz, int off)
 
   int costas[] = { 3, 1, 4, 0, 6, 5, 2 };
 
-  double sum = 0;
+  double sig = 0;
+  double noise = 0;
+
   for(int si = 0; si < 7; si++){
-    auto fft1 = one_fft(samples200, off+(si+0)*32, 32);
-    auto fft2 = one_fft(samples200, off+(si+36)*32, 32);
-    auto fft3 = one_fft(samples200, off+(si+72)*32, 32);
+    auto fft1 = one_fft(samples200, off+(si+0)*32, 32, "one_strength");
+    auto fft2 = one_fft(samples200, off+(si+36)*32, 32, "one_strength");
+    auto fft3 = one_fft(samples200, off+(si+72)*32, 32, "one_strength");
     for(int bi = 0; bi < 8; bi++){
       double x = 0;
       x += std::abs(fft1[bin0+bi]);
       x += std::abs(fft2[bin0+bi]);
       x += std::abs(fft3[bin0+bi]);
       if(bi == costas[si]){
-        sum += x;
+        sig += x;
       } else {
-        sum -= x / 7.0;
+        noise += x;;
       }
     }
   }
-  return sum;
+  
+  if(strength_how == 0){
+     return sig - noise;
+  } else if(strength_how == 1){
+    return sig - noise/7;
+  } else if(strength_how == 2){
+    return sig / (noise/7);
+  } else if(strength_how == 3){
+    return sig / (sig + (noise/7));
+  } else if(strength_how == 4){
+    return sig;
+  } else if(strength_how == 5){
+    return sig / (sig + noise);
+  } else if(strength_how == 6){
+    return sig / noise;
+  } else {
+    assert(0);
+  }
 }
 
 //
@@ -776,19 +875,36 @@ one_strength_known(const std::vector<double> &samples200,
   
   int bin0 = round(hz / 6.25);
 
-  double sum = 0;
+  double sig = 0;
+  double noise = 0;
   for(int si = 0; si < 79; si++){
-    auto fft1 = one_fft(samples200, off+si*32, 32);
+    auto fft1 = one_fft(samples200, off+si*32, 32, "one_strength_known");
     for(int bi = 0; bi < 8; bi++){
       double x = std::abs(fft1[bin0+bi]);
       if(bi == syms[si]){
-        sum += x;
+        sig += x;
       } else {
-        sum -= x / 7.0;
+        noise += x;
       }
     }
   }
-  return sum;
+  if(strength_how == 0){
+     return sig - noise;
+  } else if(strength_how == 1){
+    return sig - noise/7;
+  } else if(strength_how == 2){
+    return sig / (noise/7);
+  } else if(strength_how == 3){
+    return sig / (sig + (noise/7));
+  } else if(strength_how == 4){
+    return sig;
+  } else if(strength_how == 5){
+    return sig / (sig + noise);
+  } else if(strength_how == 6){
+    return sig / noise;
+  } else {
+    assert(0);
+  }
 }
 
 int
@@ -874,38 +990,33 @@ search_time_fine_known(const std::vector<double> &samples200,
 // hz0 +/- hz_win in hz_inc increments. hz0 should be near 25.
 // off0 +/- off_win in off_inc incremenents.
 //
-int
+std::vector<Strength>
 search_both(const std::vector<double> &samples200,
-            double hz0, double hz_inc, double hz_win,
-            int off0, int off_inc, int off_win,
-            double &hz_out, int &off_out)
+            double hz0, int hz_fracs, double hz_win,
+            int off0, int off_fracs, int off_win)
 {
   assert(hz0 >= 25 - 6.25/2 && hz0 <= 25 + 6.25/2);
-  
-  int got_best = 0;
-  double best_hz = 0;
-  int best_off = 0;
-  double best_str = 0;
 
-  for(double hz = hz0 - hz_win; hz <= hz0 + hz_win; hz += hz_inc){
+  std::vector<Strength> strengths;
+  
+  double hz_inc = 2 * hz_win / hz_fracs;
+  int off_inc = round(2 * off_win / (double) off_fracs);
+  
+
+  for(double hz = hz0 - hz_win; hz <= hz0 + hz_win + 0.01; hz += hz_inc){
     double str = 0;
     int off = search_time_fine(samples200, off0 - off_win, off0 + off_win, hz,
                                off_inc, str);
-    if(off >= 0 && (got_best == 0 || str > best_str)){
-      got_best = 1;
-      best_hz = hz;
-      best_off = off;
-      best_str = str;
+    if(off >= 0){
+      Strength st;
+      st.hz_ = hz;
+      st.off_ = off;
+      st.strength_ = str;
+      strengths.push_back(st);
     }
   }
 
-  if(got_best){
-    hz_out = best_hz;
-    off_out = best_off;
-    return 1;
-  } else {
-    return 0;
-  }
+  return strengths;
 }
 
 void
@@ -953,9 +1064,6 @@ std::vector<double>
 fft_shift(const std::vector<double> &samples, int off, int len,
           int rate, double hz)
 {
-#if 0
-  std::vector<std::complex<double>> bins = one_fft(samples, off, len);
-#else
   // horrible hack to avoid repeated FFTs on the same input.
   hack_mu_.lock();
   std::vector<std::complex<double>> bins;
@@ -964,7 +1072,7 @@ fft_shift(const std::vector<double> &samples, int off, int len,
      samples[0] == hack_0_ && samples[1] == hack_1_){
     bins = hack_bins_;
   } else {
-    bins = one_fft(samples, off, len);
+    bins = one_fft(samples, off, len, "fft_shift");
     hack_bins_ = bins;
     hack_size_ = samples.size();
     hack_off_ = off;
@@ -974,7 +1082,6 @@ fft_shift(const std::vector<double> &samples, int off, int len,
     hack_data_ = samples.data();
   }
   hack_mu_.unlock();
-#endif
   
   int nbins = bins.size();
 
@@ -989,7 +1096,7 @@ fft_shift(const std::vector<double> &samples, int off, int len,
       bins1[i] = 0;
     }
   }
-  std::vector<double> out = one_ifft(bins1);
+  std::vector<double> out = one_ifft(bins1, "fft_shift");
   return out;
 }
 
@@ -1008,13 +1115,12 @@ shift200(const std::vector<double> &samples200, int off, int len, double hz)
 
 // returns a mini-FFT of 79 8-tone symbols.
 ffts_t
-extract(const std::vector<double> &samples200, double hz, int off, int factor)
+extract(const std::vector<double> &samples200, double hz, int off)
 {
   // put hz in the middle of bin 4, at 25.0.
-  std::vector<double> downsamples200 = shift200(samples200, 0,
-                                                samples200.size(), hz);
+  std::vector<double> downsamples200 = shift200(samples200, 0, samples200.size(), hz);
 
-  ffts_t bins3 = ffts(downsamples200, off, 32);
+  ffts_t bins3 = ffts(downsamples200, off, 32, "extract");
 
   ffts_t m79(79);
   for(int si = 0; si < 79; si++){
@@ -1319,6 +1425,9 @@ prepare_soft(const ffts_t &c79, double ll174[], int best_off)
         }
       }
 
+      double maxlog = 4.97;
+      double ll = 0;
+
       //
       // Bayes combining rule normalization from:
       // http://cs.wellesley.edu/~anderson/writing/naive-bayes.pdf
@@ -1334,7 +1443,7 @@ prepare_soft(const ffts_t &c79, double ll174[], int best_off)
         pzero = 1.0 - apriori174[lli];
         pone = apriori174[lli];
       }
-
+      
       // zero
       double a = pzero *
         bests[range].problt(best_zero, problt_how) *
@@ -1344,28 +1453,25 @@ prepare_soft(const ffts_t &c79, double ll174[], int best_off)
       double b = pone *
         bests[range].problt(best_one, problt_how) *
         (1.0 - noises[range].problt(best_zero, problt_how));
-
+      
       double p;
       if(a + b == 0){
         p = 0.5;
       } else {
         p = a / (a + b);
       }
-
-      double maxlog = 4.97;
-
-      double ll;
+      
       if(1 - p == 0.0){
         ll = maxlog;
       } else {
         ll = log(p / (1 - p));
       }
-      
+        
       if(ll > maxlog)
         ll = maxlog;
       if(ll < -maxlog)
         ll = -maxlog;
-
+      
       ll174[lli++] = ll;
     }
   }
@@ -1417,6 +1523,58 @@ decode(const double ll174[], int a174[], int use_osd, std::string &comment)
 }
 
 //
+// bandpass filter some FFT bins.
+// smooth transition from stop-band to pass-band,
+// so that it's not a brick-wall filter, so that it
+// doesn't ring.
+//
+std::vector<std::complex<double>>
+fbandpass(const std::vector<std::complex<double>> &bins0,
+          double bin_hz,
+          double low_outer,  // start of transition
+          double low_inner,  // start of flat area
+          double high_inner, // end of flat area
+          double high_outer) // end of transition
+{
+  // assert(low_outer >= 0);
+  assert(low_outer <= low_inner);
+  assert(low_inner <= high_inner);
+  assert(high_inner < high_outer);
+  // assert(high_outer <= bin_hz * bins0.size());
+  
+  int nbins = bins0.size();
+  std::vector<std::complex<double>> bins1(nbins);
+
+  for(int i = 0; i < nbins; i++){
+    double ihz = i * bin_hz;
+    // cos(x)+flat+cos(x) taper
+    double factor;
+    if(ihz <= low_outer || ihz >= high_outer){
+      factor = 0;
+    } else if(ihz >= low_outer && ihz < low_inner){
+      // rising shoulder
+      double theta = (ihz - low_outer) / (low_inner-low_outer); // 0 .. 1
+      theta -= 1; // -1 .. 0
+      theta *= 3.14159; // -pi .. 0
+      factor = cos(theta); // -1 .. 1
+      factor = (factor + 1) / 2; // 0 .. 1
+    } else if(ihz > high_inner && ihz <= high_outer){
+      // falling shoulder
+      double theta =  (high_outer - ihz) / (high_outer-high_inner); // 1 .. 0
+      theta = 1.0 - theta; // 0 .. 1
+      theta *= 3.14159; // 0 .. pi
+      factor = cos(theta); // 1 .. -1
+      factor = (factor + 1) / 2; // 1 .. 0
+    } else {
+      factor = 1.0;
+    }
+    bins1[i] = bins0[i] * factor;
+  }
+
+  return bins1;
+}
+
+//
 // move hz down to 25, filter+convert to 200 samples/second.
 //
 // like fft_shift(). one big FFT, move bins down and
@@ -1429,7 +1587,7 @@ std::vector<double>
 down_v7(const std::vector<double> &samples, double hz)
 {
   int len = samples.size();
-  std::vector<std::complex<double>> bins = one_fft(samples, 0, len);
+  std::vector<std::complex<double>> bins = one_fft(samples, 0, len, "down_v7");
   int nbins = bins.size();
 
   double bin_hz = rate_ / (double) len;
@@ -1446,62 +1604,26 @@ down_v7(const std::vector<double> &samples, double hz)
 
   // now filter to fit in 200 samples/second.
 
-  double edge01 = 25.0 - shoulder_extra;
-  double edge00 = edge01 - shoulder;
-  if(edge00 < 0)
-    edge00 = 0;
-  double edge10 = 75 - 6.25 + shoulder_extra;
-  double edge11 = edge10 + shoulder;
-  if(edge11 > 100)
-    edge11 = 100;
+  double low_inner = 25.0 - shoulder200_extra;
+  double low_outer = low_inner - shoulder200;
+  if(low_outer < 0)
+    low_outer = 0;
+  double high_inner = 75 - 6.25 + shoulder200_extra;
+  double high_outer = high_inner + shoulder200;
+  if(high_outer > 100)
+    high_outer = 100;
 
-  for(int i = 0; i < nbins; i++){
-    double ihz = i * bin_hz;
-    if(shoulder < -1.5){
-      // the full 100 hz for 200 samples/second, no cutoff or taper.
-      // this works pretty well.
-      if(ihz >= 100){
-        bins1[i] = 0;
-      }
-    } else if(shoulder < 0){
-      // sharp cutoff around tones, no taper
-      // this works poorly if shoulder_extra=0.
-      if(ihz < edge01 || ihz > edge10){
-        bins1[i] = 0;
-      }
-    } else {
-      // cos(x)+flat+cos(x) taper
-      double factor;
-      if(ihz <= edge00 || ihz >= edge11){
-        factor = 0;
-      } else if(ihz >= edge00 && ihz < edge01){
-        // rising shoulder
-        double theta = (ihz - edge00) / (edge01-edge00); // 0 .. 1
-        theta -= 1; // -1 .. 0
-        theta *= 3.14159; // -pi .. 0
-        factor = cos(theta); // -1 .. 1
-        factor = (factor + 1) / 2; // 0 .. 1
-      } else if(ihz > edge10 && ihz <= edge11){
-        // falling shoulder
-        double theta =  (edge11 - ihz) / (edge11-edge10); // 1 .. 0
-        theta = 1.0 - theta; // 0 .. 1
-        theta *= 3.14159; // 0 .. pi
-        factor = cos(theta); // 1 .. -1
-        factor = (factor + 1) / 2; // 1 .. 0
-      } else {
-        factor = 1.0;
-      }
-      bins1[i] *= factor;
-    }
-  }
+  bins1 = fbandpass(bins1, bin_hz,
+                    low_outer, low_inner,
+                    high_inner, high_outer);
 
-  // convert back to time domain
-  std::vector<double> vv = one_ifft(bins1);
-
-  // re-sample to 200 samples/second.
-  // no need to worry about aliasing, due to the bandpass.
-  std::vector<double> out = resample(vv, rate_, 200);
-
+  // convert back to time domain and down-sample to 200 samples/second.
+  int blen = round(samples.size() * (200.0 / rate_));
+  std::vector<std::complex<double>> bbins(blen / 2 + 1);
+  for(int i = 0; i < bbins.size(); i++)
+    bbins[i] = bins1[i];
+  std::vector<double> out = one_ifft(bbins, "down_v7");
+  
   return out;
 }
 
@@ -1541,59 +1663,27 @@ one(const std::vector<double> &samples, double hz, int off)
 int
 one_iter(const std::vector<double> &samples200, int best_off, double hz_for_cb)
 {
-  double best_hz;
-  int ok = search_both(samples200,
-                       25, second_hz_inc, second_hz_win,
-                       best_off, second_off_inc * 32, second_off_win * 32,
-                       best_hz, best_off);
-  if(ok != 1){
-    return 0;
-  }
+  std::vector<Strength> strengths =
+    search_both(samples200,
+                25, second_hz_fracs, second_hz_win,
+                best_off, second_off_fracs, second_off_win * 32);
+  //
+  // sort strongest-first.
+  //
+  std::sort(strengths.begin(), strengths.end(),
+            [](const Strength &a, const Strength &b) -> bool
+            { return a.strength_ > b.strength_; } );
 
-#if 1
-  if(drift <= 0){
-    int ret = one_iter1(samples200, best_off, best_hz, hz_for_cb, hz_for_cb);
-    return ret;
-  }
-  
-  double drifts[3] = { 0, -drift, drift };
-
-  double best_st = 0;
-  int got_best = 0;
-  double best_dr = 0;
-  std::vector<double> best_ss;
-
-  for(int drifti = 0; drifti < 3; drifti++){
-    double dr = drifts[drifti];
-
-    // apply frequency drift, and put best_hz at 25.
-    std::vector<double> ss1;
-    if(drifti == 0){
-      assert(dr == 0.0);
-      ss1 = shift200(samples200, 0, samples200.size(), best_hz);
-    } else {
-      assert(dr != 0.0);
-      ss1 = hilbert_shift(samples200, (25-best_hz)+dr, (25-best_hz)-dr, 200);
-    }
-
-    double st = one_strength(ss1, 25, best_off);
-    if(!got_best || st > best_st){
-      got_best = 1;
-      best_st = st;
-      best_dr = dr;
-      best_ss = ss1;
+  for(int i = 0; i < strengths.size() && i < second_count; i++){
+    double hz = strengths[i].hz_;
+    int off = strengths[i].off_;
+    int ret = one_iter1(samples200, off, hz, hz_for_cb, hz_for_cb);
+    if(ret > 0){
+      return ret;
     }
   }
 
-  int ret = one_iter1(best_ss, best_off, 25.0,
-                      hz_for_cb-best_dr+(best_hz-25),
-                      hz_for_cb+best_dr+(best_hz-25));
-  return ret;
-#else
-  int ret = one_iter1(samples200, best_off, best_hz, hz_for_cb, hz_for_cb);
-  return ret;
-#endif
-  
+  return 0;
 }
 
 //
@@ -1658,9 +1748,8 @@ one_iter1(const std::vector<double> &samples200,
           int best_off, double best_hz,
           double hz0_for_cb, double hz1_for_cb)
 {
-
   // mini 79x8 FFT.
-  ffts_t m79 = extract(samples200, best_hz, best_off, 0);
+  ffts_t m79 = extract(samples200, best_hz, best_off);
 
   double ll174[174];
   prepare_soft(m79, ll174, best_off);
@@ -1668,9 +1757,8 @@ one_iter1(const std::vector<double> &samples200,
 
   int ret = try_decode(ll174, samples200, best_hz, best_off,
                        hz0_for_cb, hz1_for_cb, 1, "", m79);
-  if(ret){
+  if(ret)
     return ret;
-  }
 
   if(use_hints){
     for(int hi = 0; hi < (int)hints1_.size(); hi++){
@@ -1757,7 +1845,7 @@ subtract(const std::vector<int> re79,
   double diff1 = (bin0 * bin_hz) - hz1;
   std::vector<double> moved = hilbert_shift(nsamples_, diff0, diff1, rate_);
 
-  ffts_t bins = ffts(moved, off0, block);
+  ffts_t bins = ffts(moved, off0, block, "subtract");
 
   if(bin0 + 8 > bins[0].size())
     return;
@@ -1811,7 +1899,7 @@ subtract(const std::vector<int> re79,
       bins[si][sym] = 0;
     }
 
-    std::vector<double> ss = one_ifft(bins[si]);
+    std::vector<double> ss = one_ifft(bins[si], "subtract");
     assert(ss.size() == block);
     for(int jj = 0; jj < block; jj++){
       moved[off0 + block*si + jj] = ss[jj];
@@ -1844,13 +1932,6 @@ try_decode(double ll174[174], const std::vector<double> &samples200,
     // reconstruct correct 79 symbols from LDPC output.
     std::vector<int> re79 = recode(a174);
 
-    // and fine-tune offset and hz.
-    double best_strength = 0;
-    search_both_known(samples200, re79,
-                      best_hz, third_hz_inc, third_hz_win,
-                      best_off, third_off_inc, third_off_win,
-                      best_hz, best_off, best_strength);
-
     double off_sec = best_off / 200.0;
 
     // hz0_for_cb and corrected_hz* refers to samples_,
@@ -1866,7 +1947,7 @@ try_decode(double ll174[174], const std::vector<double> &samples200,
     if(cb_ != 0){
       cb_mu_.lock();
       int ret = cb_(a174, corrected_hz0 + down_hz_, corrected_hz1 + down_hz_,
-                    off_sec, comment.c_str(), snr);
+                    off_sec, comment.c_str(), snr, pass_);
       cb_mu_.unlock();
       if(ret == 2){
         // a new decode.
@@ -1919,16 +2000,6 @@ recode(int a174[])
 
 std::mutex FT8::cb_mu_;
 
-extern "C" {
-  // let Python call just entry(), rather than a C++ mangled name.
-  void entry(double xsamples[], int nsamples, int start, int rate,
-             double min_hz,
-             double max_hz,
-             int hints1[], int hints2[], double time_left,
-             double total_time_left, cb_t cb);
-  double set(char *param, char *val);
-}
-
 //
 // Python calls these.
 //
@@ -1943,7 +2014,7 @@ entry(double xsamples[], int nsamples, int start, int rate,
   double t0 = now();
   double deadline = t0 + time_left;
   double final_deadline = t0 + total_time_left;
-  
+
   std::vector<double> samples(nsamples);
   for(int i = 0; i < nsamples; i++){
     samples[i] = xsamples[i];
@@ -1960,10 +2031,19 @@ entry(double xsamples[], int nsamples, int start, int rate,
   std::vector<FT8 *> thv;
 
   for(int i = 0; i < nthreads; i++){
+    double hz0 = min_hz + i * per;
+    if(i > 0 || overlap_edges)
+      hz0 -= overlap;
+    
+    double hz1 = min_hz + (i + 1) * per;
+    if(i != nthreads-1 || overlap_edges)
+      hz1 += overlap;
+
     FT8 *ft8 = new FT8(samples,
-                       std::max(0.0, min_hz + i * per - overlap),
-                       min_hz + (i + 1) * per + overlap,
-                       start, rate, hints1, hints2, deadline, final_deadline, cb);
+                       hz0, hz1,
+                       start, rate,
+                       hints1, hints2,
+                       deadline, final_deadline, cb);
 
     ft8->th_ = new std::thread( [ ft8 ] () { ft8->go(); } );
     thv.push_back(ft8);
@@ -1991,11 +2071,11 @@ set(char *param, char *val)
      { "soft_ranges", &soft_ranges, 0 },
      { "best_in_noise", &best_in_noise, 0 },
      { "ldpc_iters", &ldpc_iters, 0 },
-     { "shoulder", &shoulder, 1 },
-     { "shoulder_extra", &shoulder_extra, 1 },
-     { "second_hz_inc", &second_hz_inc, 1 },
+     { "shoulder200", &shoulder200, 1 },
+     { "shoulder200_extra", &shoulder200_extra, 1 },
+     { "second_hz_fracs", &second_hz_fracs, 0 },
      { "second_hz_win", &second_hz_win, 1 },
-     { "second_off_inc", &second_off_inc, 1 },
+     { "second_off_fracs", &second_off_fracs, 0 },
      { "second_off_win", &second_off_win, 1 },
      { "third_hz_inc", &third_hz_inc, 1 },
      { "third_hz_win", &third_hz_win, 1 },
@@ -2022,9 +2102,20 @@ set(char *param, char *val)
      { "sub_amp_win", &sub_amp_win, 0 },
      { "nyquist", &nyquist, 1 },
      { "oddrate", &oddrate, 0 },
-     { "reduce_slop", &reduce_slop, 1 },
      { "osd_ldpc_thresh", &osd_ldpc_thresh, 0 },
      { "pass0_frac", &pass0_frac, 1 },
+     { "go_extra", &go_extra, 1 },
+     { "reduce_len", &reduce_len, 0 },
+     { "reduce_how", &reduce_how, 0 },
+     { "reduce_margin", &reduce_margin, 1 },
+     { "do_reduce", &do_reduce, 0 },
+     { "pass_threshold", &pass_threshold, 0 },
+     { "strength_how", &strength_how, 0 },
+     { "reduce_shoulder", &reduce_shoulder, 1 },
+     { "overlap_edges", &overlap_edges, 0 },
+     { "coarse_strength_how", &coarse_strength_how, 0 },
+     { "coarse_all", &coarse_all, 1 },
+     { "second_count", &second_count, 0 },
     };
   int nparams = sizeof(params) / sizeof(params[0]);
 
@@ -2048,5 +2139,6 @@ set(char *param, char *val)
     }
   }
   fprintf(stderr, "ft8.cc set(%s, %s) unknown parameter\n", param, val);
+  exit(1);
   return 0;
 }
