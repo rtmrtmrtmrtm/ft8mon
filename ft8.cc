@@ -1932,6 +1932,13 @@ try_decode(double ll174[174], const std::vector<double> &samples200,
     // reconstruct correct 79 symbols from LDPC output.
     std::vector<int> re79 = recode(a174);
 
+    // fine-tune offset and hz for better subtraction.
+    double best_strength = 0;
+    search_both_known(samples200, re79,
+                      best_hz, third_hz_inc, third_hz_win,
+                      best_off, third_off_inc, third_off_win,
+                      best_hz, best_off, best_strength);
+
     double off_sec = best_off / 200.0;
 
     // hz0_for_cb and corrected_hz* refers to samples_,
