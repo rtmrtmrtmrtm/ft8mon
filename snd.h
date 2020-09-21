@@ -2,6 +2,7 @@
 #define snd_h 1
 
 #include <math.h>
+#include <assert.h>
 #ifdef AIRSPYHF
 #include <liquid/liquid.h>
 #endif
@@ -20,8 +21,9 @@ class SoundIn {
 public:
   virtual void start() = 0;
   virtual int rate() = 0;
-  virtual std::vector<double> get(int n, double &t0) = 0;
+  virtual std::vector<double> get(int n, double &t0, int latest) = 0;
   void levels();
+  virtual int set_freq(int) { return -1; }
   static SoundIn *open(std::string card, std::string chan);
 };
 
@@ -43,7 +45,7 @@ class CardSoundIn : public SoundIn {
  public:
   CardSoundIn(int card, int chan);
   void start();
-  std::vector<double> get(int n, double &t0);
+  std::vector<double> get(int n, double &t0, int latest);
   int rate() { return rate_; }
 
   static int cb(const void *input,
@@ -68,7 +70,7 @@ public:
   }
   int rate() { return rate_; }
   void start() { };
-  std::vector<double> get(int n, double &t0) {
+  std::vector<double> get(int n, double &t0, int latest) {
     t0 = t_;
 
     std::vector<double> v;
@@ -97,8 +99,8 @@ class AirspySoundIn : public SoundIn {
   unsigned int hz_;
   int air_rate_; // 192000
   int rate_; // 12000
-  long long total_; // sample count
-  double start_time_;
+  double time_; // of most recent sample, buf_[wi_-1]
+  long long count_; // of samples, for rate reduction.
 
   firfilt_crcf filter_;
 
@@ -107,14 +109,14 @@ class AirspySoundIn : public SoundIn {
   std::complex<double> *buf_;
   volatile int wi_;
   volatile int ri_;
-  double time_; // of most recent sample, buf_[wi_-1]
 
  public:
   AirspySoundIn(std::string chan);
   ~AirspySoundIn() { firfilt_crcf_destroy(filter_); }
   void start();
-  std::vector<double> get(int n, double &t0);
+  std::vector<double> get(int n, double &t0, int latest);
   int rate() { return rate_; }
+  int set_freq(int);
 
   static int cb1(airspyhf_transfer_t *);
   int cb2(airspyhf_transfer_t *);

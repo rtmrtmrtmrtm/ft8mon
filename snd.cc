@@ -27,6 +27,32 @@ snd_init()
   }
 }
 
+extern "C" void
+airspy_list()
+{
+#ifdef AIRSPYHF
+  int ndev = airspyhf_list_devices(0, 0);
+  if(ndev > 0){
+    uint64_t serials[20];
+    if(ndev > 20)
+      ndev = 20;
+    airspyhf_list_devices(serials, ndev);
+    for(int unit = 0; unit < ndev; unit++){
+      airspyhf_device_t *dev = 0;
+      if(airspyhf_open_sn(&dev, serials[unit]) == AIRSPYHF_SUCCESS){
+        airspyhf_read_partid_serialno_t read_partid_serialno;
+        airspyhf_board_partid_serialno_read(dev, &read_partid_serialno);
+        printf("Airspy HF+ serial %08X%08X\n",
+               read_partid_serialno.serial_no[0],
+               read_partid_serialno.serial_no[1]);
+      } else {
+        fprintf(stderr, "could not open airspyhf unit %d\n", unit);
+      }
+    }
+  }
+#endif
+}
+
 //
 // print a list of sound devices
 //
@@ -66,27 +92,7 @@ snd_list()
     printf("\n");
   }
 
-#ifdef AIRSPYHF
-  int ndev = airspyhf_list_devices(0, 0);
-  if(ndev > 0){
-    unsigned long long serials[20];
-    if(ndev > 20)
-      ndev = 20;
-    airspyhf_list_devices(serials, ndev);
-    for(int i = 0; i < ndev; i++){
-      airspyhf_device_t *dev = 0;
-      if(airspyhf_open_sn(&dev, serials[i]) == AIRSPYHF_SUCCESS){
-        airspyhf_read_partid_serialno_t read_partid_serialno;
-        airspyhf_board_partid_serialno_read(dev, &read_partid_serialno);
-        printf("Airspy HF+ S/N %08X%08X\n",
-               read_partid_serialno.serial_no[0],
-               read_partid_serialno.serial_no[1]);
-      } else {
-        fprintf(stderr, "could not open airspyhf serial %llu\n", serials[i]);
-      }
-    }
-  }
-#endif
+  airspy_list();
 }
 
 //
@@ -102,7 +108,7 @@ SoundIn::levels()
 
   while(1){
     double dummy;
-    std::vector<double> buf = get(rate(), dummy);
+    std::vector<double> buf = get(rate(), dummy, 0);
     if(buf.size() == 0)
       usleep(100*1000);
     for(int i = 0; i < buf.size(); i++){
@@ -160,8 +166,8 @@ CardSoundIn::cb(const void *input,
 
   if(statusFlags != 0){
     // 2 is paInputOverflow
-    fprintf(stderr, "CardSoundIn::cb statusFlags 0x%x\n", (int)statusFlags);
-    exit(1);
+    fprintf(stderr, "CardSoundIn::cb statusFlags 0x%x frameCount %d\n",
+            (int)statusFlags, (int)frameCount);
   }
 
   for(int i = 0; i < frameCount; i++){
@@ -170,7 +176,6 @@ CardSoundIn::cb(const void *input,
       sin->wi_ = (sin->wi_ + 1) % sin->n_;
     } else {
       fprintf(stderr, "CardSoundIn::cb buf_ overflow\n");
-      exit(1);
       break;
     }
   }
@@ -194,9 +199,11 @@ CardSoundIn::CardSoundIn(int card, int chan)
 // return immediately with whatever samples exist,
 // perhaps fewer than n.
 // return UNIX time of first sample in t0.
+// if latest==1, return (up to) the most recent n samples
+// and discard any earlier samples.
 //
 std::vector<double>
-CardSoundIn::get(int n, double &t0)
+CardSoundIn::get(int n, double &t0, int latest)
 {
   std::vector<double> v;
 
@@ -206,9 +213,15 @@ CardSoundIn::get(int n, double &t0)
     return v;
   }
 
+  if(latest){
+    while(((wi_ + n_ - ri_) % n_) > n){
+      ri_ = (ri_ + 1) % n_;
+    }
+  }
+
   // calculate time of first sample in buf_.
   // XXX there's a race here with cb().
-  t0 = time_ + dt_; // time of last sample in buf_.
+  t0 = time_ + dt_; // UNIX time of last sample in buf_.
   if(wi_ > ri_){
     t0 -= (wi_ - ri_) * (1.0 / rate_);
   } else {
@@ -255,9 +268,10 @@ CardSoundIn::start()
   ip.device = card_;
   ip.channelCount = channels_;
   ip.sampleFormat = paInt16;
+  ip.hostApiSpecificStreamInfo = 0;
+
   // don't set latency to zero; this causes problems on Linux.
   ip.suggestedLatency = Pa_GetDeviceInfo(card_)->defaultLowInputLatency;
-  ip.hostApiSpecificStreamInfo = 0;
   
   PaStream *str = 0;
   PaError err = Pa_OpenStream(&str,
@@ -297,20 +311,38 @@ CardSoundIn::start()
 
 #ifdef AIRSPYHF
 //
-// chan argument is megahertz.
+// chan argument is serial[,megahertz].
+// e.g. 3B52EB5DAC35398D,14.074
+// or -,megahertz
+// or just serial #
 //
 AirspySoundIn::AirspySoundIn(std::string chan)
 {
   device_ = 0;
-  hz_ = 1000000.0 * atof(chan.c_str());
+  //hz_ = 1000000.0 * atof(chan.c_str());
+  hz_ = 10 * 1000 * 1000;
   air_rate_ = 192 * 1000;;
-  rate_ = 12000;
-  total_ = 0;
-  start_time_ = 0;
+  rate_ = 6000;
+  time_ = -1;
+  count_ = 0;
 
-  if( airspyhf_open(&device_) != AIRSPYHF_SUCCESS ) {
-    fprintf(stderr, "airspyhf_open() failed\n");
-    exit(1);
+  int comma = chan.find(",");
+  if(comma >= 0){
+    hz_ = atof(chan.c_str() + comma + 1) * 1000000.0;
+  }
+
+  if(comma == 0 || chan.size() < 1 || chan[0] == '-'){
+    if(airspyhf_open(&device_) != AIRSPYHF_SUCCESS ) {
+      fprintf(stderr, "airspyhf_open() failed\n");
+      exit(1);
+    }
+  } else {
+    // open by Airspy HF+ serial number.
+    uint64_t serial = strtoull(chan.c_str(), 0, 16);
+    if(airspyhf_open_sn(&device_, serial) != AIRSPYHF_SUCCESS ) {
+      fprintf(stderr, "airspyhf_open_sn(%llx) failed\n", serial);
+      exit(1);
+    }
   }
 
   if (airspyhf_set_samplerate(device_, air_rate_) != AIRSPYHF_SUCCESS) {
@@ -318,15 +350,14 @@ AirspySoundIn::AirspySoundIn(std::string chan)
     exit(1);
   }
 
-  // allocate a 30-second circular buffer
-  n_ = rate_ * 30;
+  // allocate a 60-second circular buffer
+  n_ = rate_ * 60;
   buf_ = (std::complex<double> *) malloc(sizeof(std::complex<double>) * n_);
   assert(buf_);
   wi_ = 0;
   ri_ = 0;
-  time_ = -1;
 
-  // Liquid DSP filter + resampler to convert 192000 to 12000.
+  // Liquid DSP filter + resampler to convert 192000 to 6000.
   // firdecim?
   // iirdecim?
   // msresamp?
@@ -343,6 +374,17 @@ AirspySoundIn::AirspySoundIn(std::string chan)
                        h);
   assert((air_rate_ % rate_) == 0);
   filter_ = firfilt_crcf_create(h, h_len);
+}
+
+int
+AirspySoundIn::set_freq(int hz)
+{
+  if( airspyhf_set_freq(device_, hz) != AIRSPYHF_SUCCESS ) {
+    fprintf(stderr, "airspyhf_set_freq(%d) failed.\n", hz);
+    exit(1);
+  }
+  hz_ = hz;
+  return hz;
 }
 
 void
@@ -374,17 +416,20 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
   // transfer->ctx
   // transfer->dropped_samples
   // each sample is an I/Q pair of 32-bit floats
-  if(total_ == 0){
-    start_time_ = now() - (1.0 / air_rate_) * transfer->sample_count;
-  }
 
   if(transfer->dropped_samples){
-    fprintf(stderr, "dropped_samples %d\n", (int)transfer->dropped_samples);
+    fprintf(stderr, "airspy dropped_samples %d\n", (int)transfer->dropped_samples);
   }
 
-  // I/Q
-  // low-pass-filter
-  //   maybe this: https://liquidsdr.org/doc/msresamp/
+#if 0
+  if(time_ < 0){
+    time_ = now();
+  } else {
+    time_ += (transfer->sample_count + transfer->dropped_samples) * (1.0 / air_rate_);
+  }
+#else
+  time_ = now();
+#endif
 
   airspyhf_complex_float_t *buf = transfer->samples;
   for(int i = 0; i < transfer->sample_count; i++){
@@ -395,21 +440,21 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
     firfilt_crcf_push(filter_, x);
     firfilt_crcf_execute(filter_, &y);
 
-    if((total_ % (air_rate_ / rate_)) == 0){
+    if((count_ % (air_rate_ / rate_)) == 0){
       if(((wi_ + 1) % n_) != ri_){
         // XXX what is the range of buf[i].re? 0..1?
         buf_[wi_] = std::complex<double>(y.real, y.imag);
         wi_ = (wi_ + 1) % n_;
       } else {
         fprintf(stderr, "CardSoundIn::cb buf_ overflow\n");
+        sleep(20); // XXX
         exit(1); // XXX
         break;
       }
     }
-    total_ += 1;
-  }
 
-  time_ = start_time_ + total_ * (1.0 / air_rate_);
+    count_ += 1;
+  }
 
   return 0;
 }
@@ -442,8 +487,8 @@ vimag(std::vector<std::complex<double>> a)
 std::vector<double>
 iq2usb(std::vector<std::complex<double>> a)
 {
-  std::vector<double> ii = vreal(analytic(vreal(a)));
-  std::vector<double> qq = vimag(analytic(vimag(a)));
+  std::vector<double> ii = vreal(analytic(vreal(a), "snd::iq2usb_i"));
+  std::vector<double> qq = vimag(analytic(vimag(a), "snd::iq2usb_q"));
   std::vector<double> ssb(ii.size());
   for(int i = 0; i < ii.size(); i++){
     ssb[i] = ii[i] - qq[i];
@@ -451,8 +496,9 @@ iq2usb(std::vector<std::complex<double>> a)
   return ssb;
 }
 
+// UNIX time of first sample in t0.
 std::vector<double>
-AirspySoundIn::get(int n, double &t0)
+AirspySoundIn::get(int n, double &t0, int latest)
 {
   std::vector<double> nothing;
 
@@ -462,10 +508,16 @@ AirspySoundIn::get(int n, double &t0)
     return nothing;
   }
 
+  if(latest){
+    while(((wi_ + n_ - ri_) % n_) > n){
+      ri_ = (ri_ + 1) % n_;
+    }
+  }
+
   // calculate time of first sample in buf_.
   // XXX there's a race here with cb().
   t0 = time_; // time of last sample in buf_.
-  if(wi_ > ri_){
+  if(wi_ >= ri_){
     t0 -= (wi_ - ri_) * (1.0 / rate_);
   } else {
     t0 -= ((wi_ + n_) - ri_) * (1.0 / rate_);
@@ -484,7 +536,24 @@ AirspySoundIn::get(int n, double &t0)
     // analytic() demands more than one sample.
     return vreal(v1);
   } else {
+    // pad to increase chances that we can re-use an FFT plan.
+    int olen = v1.size();
+    int quantum;
+    if(olen > rate() * 5){
+      quantum = rate();
+    } else if(olen > 1000){
+      quantum = 1000;
+    } else {
+      quantum = 100;
+    }
+    int needed = quantum - (olen % quantum);
+    if(needed != quantum){
+      v1.resize(v1.size() + needed, 0.0);
+    }
     std::vector<double> v2 = iq2usb(v1);
+    if(v2.size() > olen){
+      v2.resize(olen);
+    }
     return v2;
   }
 }
@@ -564,4 +633,54 @@ SoundOut::write(const std::vector<double> &v)
     vv[i] = v[i] * 16380;
   }
   write(vv);
+}
+
+//
+// functions for Python to call via ctypes.
+//
+
+extern "C" {
+  void *ext_snd_open(const char *card, const char *chan);
+  int ext_snd_read(void *, double *, int, double *);
+  int ext_set_freq(void *, int);
+}
+
+void *
+ext_snd_open(const char *card, const char *chan)
+{
+  SoundIn *sin = SoundIn::open(card, chan);
+  sin->start();
+  return (void *) sin;
+}
+
+//
+// reads up to maxout samples.
+// non-blocking.
+// *tm will be set to UNIX time of last sample in out[].
+// return value is number of samples written to out[].
+//
+int
+ext_snd_read(void *thing, double *out, int maxout, double *tm)
+{
+  SoundIn *sin = (SoundIn *) thing;
+  double t0; // time of first sample.
+
+  // XXX the "1" means return the latest maxout samples,
+  // and discard samples older than that!
+  std::vector<double> v = sin->get(maxout, t0, 1);
+
+  assert(v.size() <= maxout);
+  for(int i = 0; i < maxout && i < v.size(); i++){
+    out[i] = v[i];
+  }
+  *tm = t0 + v.size() * (1.0 / sin->rate()); // time of last sample.
+  return v.size();
+}
+
+int
+ext_set_freq(void *thing, int hz)
+{
+  SoundIn *sin = (SoundIn *) thing;
+  int x = sin->set_freq(hz);
+  return x;
 }
