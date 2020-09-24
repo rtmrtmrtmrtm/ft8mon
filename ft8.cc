@@ -46,15 +46,15 @@
 int nthreads = 2; // number of parallel threads, for multi-core
 int npasses = 3;  // number of spectral subtraction passes
 int ldpc_iters = 25; // how hard LDPC decoding should work
-int snr_win = 5; // averaging window, in symbols, for SNR conversion
+int snr_win = 7; // averaging window, in symbols, for SNR conversion
 int snr_how = 0; // technique to measure "N" for SNR. 0 means median of the 8 tones.
 int soft_ranges = 1;
 int best_in_noise = 1;
 double shoulder200 = 10; // for 200 sps bandpass filter
 double shoulder200_extra = 0.0; // for bandpass filter
 double second_hz_win = 3.5; // +/- hz
-int second_hz_fracs = 7; // divide total window into this many pieces
-double second_off_win = 0.7; // +/- search window in symbol-times
+int second_hz_fracs = 10; // divide total window into this many pieces
+double second_off_win = 0.5; // +/- search window in symbol-times
 int second_off_fracs = 7;
 double third_hz_inc = 6.25 / 32;
 double third_hz_win = 1;
@@ -64,11 +64,10 @@ double log_tail = 0.1;
 double log_rate = 8.0;
 int problt_how = 3;
 int use_apriori = 1;
-int use_hints = 1; // 1 means use all hints, 2 means just CQ hints
-double drift =  -1;
+int use_hints = 2; // 1 means use all hints, 2 means just CQ hints
 int win_type = 1;
 int osd_depth = 6; // don't increase beyond 6, produces too much garbage
-int osd_ldpc_thresh = 70; // demand this many correct LDPC parity bits for OSD
+int osd_ldpc_thresh = 70; // demand this many correct LDPC parity bits before OSD
 int ncoarse = 1; // number of offsets per hz produced by coarse()
 int ncoarse_blocks = 1;
 double tminus = 2.2; // start looking at 0.5 - tminus seconds
@@ -93,6 +92,7 @@ int coarse_strength_how = 6;
 double reduce_shoulder = -1;
 double coarse_all = -1;
 int second_count = 2;
+int soft_phase_win = 2;
 
 //
 // return a Hamming window of length n.
@@ -1339,6 +1339,100 @@ make_stats(const std::vector<std::vector<double>> &m79,
 }
 
 //
+// convert 79x8 complex FFT bins to magnitudes.
+//
+// exploits local phase coherence by decreasing magnitudes of bins
+// whose phase is far from the phases of nearby strongest tones.
+//
+// relies on each tone being reasonably well centered in its FFT bin
+// (in time and frequency) so that each tone completes an integer
+// number of cycles and thus preserves phase from one symbol to the
+// next.
+//
+std::vector<std::vector<double>>
+soft_c2m(const ffts_t &c79)
+{
+  std::vector< std::vector<double> > m79(79);
+  std::vector<double> raw_phases(79); // of strongest tone in each symbol time
+  for(int si = 0; si < 79; si++){
+    m79[si].resize(8);
+    int mxi = -1;
+    double mx;
+    double mx_phase;
+    for(int bi = 0; bi < 8; bi++){
+      double x = std::abs(c79[si][bi]);
+      m79[si][bi] = x;
+      if(mxi < 0 || x > mx){
+        mxi = bi;
+        mx = x;
+        mx_phase = std::arg(c79[si][bi]); // -pi .. pi
+      }
+    }
+    raw_phases[si] = mx_phase;
+  }
+
+  if(soft_phase_win <= 0)
+    return m79;
+
+  // phase around each symbol.
+  std::vector<double> phases(79);
+
+  for(int si = 0; si < 79; si++){
+    // median
+    std::vector<double> v;
+    int nhi = 0;
+    int nlo = 0;
+    for(int si1 = si - soft_phase_win; si1 <= si + soft_phase_win; si1++){
+      if(si1 >= 0 && si1 < 79){
+        double x = raw_phases[si1];
+        v.push_back(x);
+        if(x < -2)
+          nlo++;
+        if(x > 2)
+          nhi++;
+      }
+    }
+
+    // try to fix -pi / pi wrap-around.
+    int n = v.size();
+    if(nhi + nlo >= n-1){
+      if(nhi > nlo){
+        for(int i = 0; i < n; i++){
+          if(v[i] < -2){
+            v[i] += 2*M_PI;
+          }
+        }
+      } else {
+        for(int i = 0; i < n; i++){
+          if(v[i] > 2){
+            v[i] -= 2*M_PI;
+          }
+        }
+      }
+    }
+       
+    std::sort(v.begin(), v.end());
+    phases[si] = v[n/2];
+  }
+
+  // project each tone against the median phase around that symbol time.
+  for(int si = 0; si < 79; si++){
+    for(int bi = 0; bi < 8; bi++){
+      double mag = std::abs(c79[si][bi]);
+      double angle = std::arg(c79[si][bi]);
+      double d = angle - phases[si];
+      double factor = 0.1;
+      if(d < M_PI/2 && d > -M_PI/2){
+        factor = cos(d);
+      }
+      m79[si][bi] = factor * mag;
+    }
+  }
+  
+  return m79;
+}
+
+//
 // c79 is 79x8 complex tones, before un-gray-coding.
 //
 void
@@ -1348,12 +1442,7 @@ prepare_soft(const ffts_t &c79, double ll174[], int best_off)
   // still pre-un-gray-coding so we know which
   // are the correct Costas tones.
   std::vector< std::vector<double> > m79(79);
-  for(int si = 0; si < 79; si++){
-    m79[si].resize(8);
-    for(int bi = 0; bi < 8; bi++){
-      m79[si][bi] = std::abs(c79[si][bi]);
-    }
-  }
+  m79 = soft_c2m(c79);
 
   m79 = convert_to_snr(m79, snr_how, snr_win);
     
@@ -2093,7 +2182,6 @@ set(char *param, char *val)
      { "problt_how", &problt_how, 0 },
      { "use_apriori", &use_apriori, 0 },
      { "use_hints", &use_hints, 0 },
-     { "drift", &drift, 1 },
      { "win_type", &win_type, 0 },
      { "osd_depth", &osd_depth, 0 },
      { "ncoarse", &ncoarse, 0 },
@@ -2123,6 +2211,7 @@ set(char *param, char *val)
      { "coarse_strength_how", &coarse_strength_how, 0 },
      { "coarse_all", &coarse_all, 1 },
      { "second_count", &second_count, 0 },
+     { "soft_phase_win", &soft_phase_win, 0 },
     };
   int nparams = sizeof(params) / sizeof(params[0]);
 
