@@ -55,7 +55,7 @@ double shoulder200_extra = 0.0; // for bandpass filter
 double second_hz_win = 3.5; // +/- hz
 int second_hz_fracs = 10; // divide total window into this many pieces
 double second_off_win = 0.5; // +/- search window in symbol-times
-int second_off_fracs = 7;
+int second_off_fracs = 10;
 double third_hz_inc = 6.25 / 32;
 double third_hz_win = 1;
 int third_off_inc = 1;
@@ -73,17 +73,18 @@ int ncoarse_blocks = 1;
 double tminus = 2.2; // start looking at 0.5 - tminus seconds
 double tplus = 2.4;
 int coarse_off_fracs = 4;
-int coarse_hz_fracs = 5;
+int coarse_hz_fracs = 8;
 double already_hz = 27;
 double overlap = 20;
 int overlap_edges = 0;
-int sub_amp_win = 0;
-double nyquist = 0.95;
+int sub_amp_win = 1;
+int sub_phase_win = 0;
+double nyquist = 0.925;
 int oddrate = 1;
 double pass0_frac = 1.0;
 int reduce_len = 5;
 int reduce_how = 2;
-double go_extra = 3.1;
+double go_extra = 3.5;
 double reduce_margin = 0.06;
 int do_reduce = 1;
 int pass_threshold = 1;
@@ -93,6 +94,9 @@ double reduce_shoulder = -1;
 double coarse_all = -1;
 int second_count = 2;
 int soft_phase_win = 2;
+double sub_wrap_thresh = 1.5;
+double phase_wrap_thresh = 1.5;
+int fancy_subtract = 0;
 
 //
 // return a Hamming window of length n.
@@ -500,6 +504,19 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
   }
 }
 
+// return symbol length in samples at the given rate.
+// insist on integer symbol lengths so that we can
+// use whole FFT bins.
+int
+blocksize(int rate)
+{
+  // FT8 symbol length is 1920 at 12000 samples/second.
+  int xblock = 1920 / (12000.0 / rate);
+  assert(xblock == (int) xblock);
+  int block = xblock;
+  return block;
+}
+
 class Strength {
 public:
   double hz_;
@@ -514,7 +531,7 @@ public:
 std::vector<Strength>
 coarse(const ffts_t &bins, int si0, int si1)
 {
-  int block = 1920 / (12000 / rate_); // samples per symbol
+  int block = blocksize(rate_);
   int nbins = bins[0].size();
   double bin_hz = rate_ / (double) block;
   int min_bin = min_hz_ / bin_hz;
@@ -645,8 +662,13 @@ go()
   // can we reduce the sample rate?
   int rates[] = { 500, 1000, 1500, 2000, 3000, 4000, 6000, -1 };
   int nrate = -1;
+#if 0
   for(int ratei = 0; rates[ratei] > 0; ratei++){
     int xrate = rates[ratei];
+#else
+  //for(int xrate = 25; xrate < rate_; xrate += 25){
+  for(int xrate = 100; xrate < rate_; xrate += 100){
+#endif
     if(xrate < rate_ && (oddrate || (rate_ % xrate) == 0)){
       if(((max_hz_ - min_hz_) + 50 + 2*go_extra) < nyquist * (xrate / 2)){
         nrate = xrate;
@@ -654,7 +676,7 @@ go()
       }
     }
   }
-  
+
   if(do_reduce && nrate > 0 && nrate < rate_){
     // filter and reduce the sample rate from rate_ to nrate.
 
@@ -684,10 +706,8 @@ go()
     start_ = round(start_ * ratio);
   }
   
-  // FT8 symbol length is 1920 at 12000 samples/second.
-  assert((12000 % rate_) == 0);
-  assert((1920 % (12000 / rate_)) == 0);
-  int block = 1920 / (12000 / rate_);
+  int block = blocksize(rate_);
+
   double bin_hz = rate_ / (double) block;
 
   // start_ is the sample number of 0.5 seconds, the nominal start time.
@@ -1378,7 +1398,7 @@ soft_c2m(const ffts_t &c79)
   std::vector<double> phases(79);
 
   for(int si = 0; si < 79; si++){
-    // median
+    // median of nearby phases
     std::vector<double> v;
     int nhi = 0;
     int nlo = 0;
@@ -1386,10 +1406,17 @@ soft_c2m(const ffts_t &c79)
       if(si1 >= 0 && si1 < 79){
         double x = raw_phases[si1];
         v.push_back(x);
+#if 0
         if(x < -2)
           nlo++;
         if(x > 2)
           nhi++;
+#else
+        if(x < 0)
+          nlo++;
+        else
+          nhi++;
+#endif
       }
     }
 
@@ -1398,13 +1425,13 @@ soft_c2m(const ffts_t &c79)
     if(nhi + nlo >= n-1){
       if(nhi > nlo){
         for(int i = 0; i < n; i++){
-          if(v[i] < -2){
+          if(v[i] < -phase_wrap_thresh){
             v[i] += 2*M_PI;
           }
         }
-      } else {
+      } else if(nlo > nhi){
         for(int i = 0; i < n; i++){
-          if(v[i] > 2){
+          if(v[i] > phase_wrap_thresh){
             v[i] -= 2*M_PI;
           }
         }
@@ -1922,7 +1949,7 @@ subtract(const std::vector<int> re79,
          double hz1,
          double off_sec)
 {
-  int block = 1920 / (12000 / rate_);
+  int block = blocksize(rate_);
   double bin_hz = rate_ / (double) block;
   int off0 = off_sec * rate_;
 
@@ -1934,16 +1961,16 @@ subtract(const std::vector<int> re79,
   double diff1 = (bin0 * bin_hz) - hz1;
   std::vector<double> moved = hilbert_shift(nsamples_, diff0, diff1, rate_);
 
-  ffts_t bins = ffts(moved, off0, block, "subtract");
+  ffts_t bins = ffts(moved, off0, block, "subtract1");
 
   if(bin0 + 8 > bins[0].size())
     return;
   if(bins.size() < 79)
     return;
 
-  std::vector<double> tone_avg(79);
+  // for each symbol, median amplitude of nearby tones.
+  std::vector<double> nearby_amp(79);
   if(sub_amp_win > 0){
-#if 1
     for(int si = 0; si < 79; si++){
       std::vector<double> v;
       for(int i = -sub_amp_win; i <= sub_amp_win; i++){
@@ -1952,46 +1979,143 @@ subtract(const std::vector<int> re79,
           v.push_back(x);
         }
       }
+#if 1
       std::sort(v.begin(), v.end());
-      tone_avg[si] = v[v.size() / 2];
-    }
+      nearby_amp[si] = v[v.size() / 2];
 #else
+      double sum = 0;
+      for(int i = 0; i < v.size(); i++)
+        sum += v[i];
+      nearby_amp[si] = sum / v.size();
+#endif
+    }
+  }
+
+  // for each symbol, median phase of nearby symbols.
+  std::vector<double> nearby_phase(79);
+  if(fancy_subtract && sub_phase_win > 0){
+    std::vector<double> ph(79);
     for(int si = 0; si < 79; si++){
-      double x = 0;
-      int n = 0;
-      for(int i = -sub_amp_win; i <= sub_amp_win; i++){
+      ph[si] = std::arg(bins[si][bin0+re79[si]]); // -pi .. pi
+    }
+    
+    for(int si = 0; si < 79; si++){
+      std::vector<double> v;
+      int nhi = 0;
+      int nlo = 0;
+      for(int i = -sub_phase_win; i <= sub_phase_win; i++){
         if(si+i >= 0 && si+i < 79){
-          x += std::abs(bins[si+i][bin0+re79[si+i]]);
-          n++;
+          double x = ph[si+i];
+          v.push_back(x);
+          if(x < 0)
+            nlo++;
+          else
+            nhi++;
         }
       }
-      tone_avg[si] = x / n;
-    }
+
+      // try to fix -pi / pi wrap-around.
+      int n = v.size();
+      if(nhi > nlo){
+        for(int i = 0; i < n; i++){
+          if(v[i] < -sub_wrap_thresh){
+            v[i] += 2*M_PI;
+          }
+        }
+      } else if(nlo > nhi) {
+        for(int i = 0; i < n; i++){
+          if(v[i] > sub_wrap_thresh){
+            v[i] -= 2*M_PI;
+          }
+        }
+      }
+      
+#if 1
+      std::sort(v.begin(), v.end());
+      nearby_phase[si] = v[n/2];
+#else
+      double sum = 0;
+      double w = 0;
+      for(int i = 0; i < v.size(); i++){
+        sum += v[i];
+        w += 1;
+      }
+      nearby_phase[si] = sum / w;
 #endif
+    }
   }
 
   for(int si = 0; si < 79; si++){
     int sym = bin0 + re79[si];
 
-    if(sub_amp_win > 0){
-      double aa = std::abs(bins[si][sym]);
+    if(fancy_subtract){
+      std::complex<double> c = bins[si][sym];
 
-      double ampl = tone_avg[si];
-      if(ampl > aa)
-        ampl = aa;
-        
-      if(aa > 0.0){
-        bins[si][sym] /= aa;
-        bins[si][sym] *= (aa - ampl);
+      double phase;
+      if(sub_phase_win > 0){
+        phase = nearby_phase[si];
+      } else {
+        phase = std::arg(c);
+      }
+
+      double amp;
+      if(sub_amp_win > 0){
+        amp = nearby_amp[si];
+      } else {
+        amp = std::abs(c);
+      }
+
+      // amp = std::min(amp, std::abs(c));
+
+      // we know what the symbol was, and we have guesses for
+      // the signal's phase and amplitude, so subtract.
+      
+      // subtract in the time domain, since it's pretty involved
+      // to do it correctly in the frequency domain. the point is
+      // to subtract the likely signal, but to leave behind
+      // stuff at that tone that's not the same phase as the signal.
+      
+      // FFT multiplies magnitudes by number of bins,
+      // or half the number of samples.
+      amp /= (block / 2);
+      
+      double theta = phase;
+      
+      double tonehz = 6.25 * (bin0 + re79[si]);
+      
+      for(int jj = 0; jj < block; jj++){
+        double x = amp * cos(theta);
+        int iii = off0 + block*si + jj;
+        moved[iii] -= x;
+        theta += 2 * M_PI / (rate_ / tonehz);
       }
     } else {
-      bins[si][sym] = 0;
-    }
+      if(sub_amp_win > 0){
+        double aa = std::abs(bins[si][sym]);
+        
+        double amp = nearby_amp[si];
+        if(amp > aa)
+          amp = aa;
+        
+        if(aa > 0.0){
+          bins[si][sym] /= aa;
+          bins[si][sym] *= (aa - amp);
+        }
+      } else {
+        bins[si][sym] = 0;
+      }
 
-    std::vector<double> ss = one_ifft(bins[si], "subtract");
-    assert(ss.size() == block);
-    for(int jj = 0; jj < block; jj++){
-      moved[off0 + block*si + jj] = ss[jj];
+      // to get the original amplitude scale, you have to divide
+      // by blocksize before calling ifft.
+      std::vector<std::complex<double>> bb(bins[si].size());
+      for(int i = 0; i < bb.size(); i++)
+        bb[i] = bins[si][i] / (double)block;
+      
+      std::vector<double> ss = one_ifft(bb, "subtract2");
+      assert(ss.size() == block);
+      for(int jj = 0; jj < block; jj++){
+        moved[off0 + block*si + jj] = ss[jj];
+      }
     }
   }
 
@@ -2195,6 +2319,7 @@ set(char *param, char *val)
      { "npasses", &npasses, 0 },
      { "overlap", &overlap, 1 },
      { "sub_amp_win", &sub_amp_win, 0 },
+     { "sub_phase_win", &sub_phase_win, 0 },
      { "nyquist", &nyquist, 1 },
      { "oddrate", &oddrate, 0 },
      { "osd_ldpc_thresh", &osd_ldpc_thresh, 0 },
@@ -2212,6 +2337,9 @@ set(char *param, char *val)
      { "coarse_all", &coarse_all, 1 },
      { "second_count", &second_count, 0 },
      { "soft_phase_win", &soft_phase_win, 0 },
+     { "sub_wrap_thresh", &sub_wrap_thresh, 1 },
+     { "phase_wrap_thresh", &phase_wrap_thresh, 1 },
+     { "fancy_subtract", &fancy_subtract, 0 },
     };
   int nparams = sizeof(params) / sizeof(params[0]);
 
