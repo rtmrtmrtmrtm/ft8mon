@@ -87,7 +87,7 @@ main(int argc, char *argv[])
   fftw_type = FFTW_ESTIMATE; // rather than FFTW_MEASURE
 
   extern int nthreads;
-  nthreads = 1; // multi-core?
+  nthreads = 4; // multi-core?
   
   if(argc == 4 && strcmp(argv[1], "-card") == 0){
     int wanted_rate = 12000;
