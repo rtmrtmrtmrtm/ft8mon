@@ -10,6 +10,8 @@
 
 int fftw_type = FFTW_MEASURE;
 
+#define TIMING 0
+
 // a cached fftw plan, for both of:
 // fftw_plan_dft_r2c_1d(n, m_in, m_out, FFTW_ESTIMATE);
 // fftw_plan_dft_c2r_1d(n, m_in, m_out, FFTW_ESTIMATE);
@@ -32,29 +34,42 @@ public:
   fftw_complex *cc2_; // n
   fftw_plan cfwd_; // forward plan
   fftw_plan crev_; // reverse plan
+
+  // how much CPU time spent in FFTs that use this plan.
+#if TIMING
+  double time_;
+#endif
+  const char *why_;
+  int uses_;
 };
 
 static std::mutex plansmu;
-static std::vector<Plan> plans;
+static Plan *plans[1000];
+static int nplans;
 static int plan_master_pid = 0;
 
-void
-get_plan(int n, Plan &p, const char *why)
+Plan *
+get_plan(int n, const char *why)
 {
   // cache fftw plans in the parent process,
   // so they will already be there for fork()ed children.
-  
+
   plansmu.lock();
   
   if(plan_master_pid == 0){
     plan_master_pid = getpid();
   }
     
-  for(ulong i = 0; i < plans.size(); i++){
-    if(plans[i].n_ == n){
-      p = plans[i];
+  for(int i = 0; i < nplans; i++){
+    if(plans[i]->n_ == n
+#if TIMING
+       && strcmp(plans[i]->why_, why) == 0
+#endif
+       ){
+      Plan *p = plans[i];
+      p->uses_ += 1;
       plansmu.unlock();
-      return;
+      return p;
     }
   }
 
@@ -72,15 +87,24 @@ get_plan(int n, Plan &p, const char *why)
   int lockret = flock(lockfd, LOCK_EX);
   assert(lockret == 0);
 
+  fftw_set_timelimit(5);
+
   //
   // real -> complex
   //
+
+  Plan *p = new Plan;
   
-  p.n_ = n;
-  p.r_ = (double*) fftw_malloc(n * sizeof(double));
-  assert(p.r_);
-  p.c_ = (fftw_complex*) fftw_malloc(((n/2)+1) * sizeof(fftw_complex));
-  assert(p.c_);
+  p->n_ = n;
+#if TIMING
+  p->time_ = 0;
+#endif
+  p->uses_ = 1;
+  p->why_ = why;
+  p->r_ = (double*) fftw_malloc(n * sizeof(double));
+  assert(p->r_);
+  p->c_ = (fftw_complex*) fftw_malloc(((n/2)+1) * sizeof(fftw_complex));
+  assert(p->c_);
   
   // FFTW_ESTIMATE
   // FFTW_MEASURE
@@ -90,35 +114,41 @@ get_plan(int n, Plan &p, const char *why)
   if(getpid() != plan_master_pid){
     type = FFTW_ESTIMATE;
   }
-  p.fwd_ = fftw_plan_dft_r2c_1d(n, p.r_, p.c_, type);
-  assert(p.fwd_);
-  p.rev_ = fftw_plan_dft_c2r_1d(n, p.c_, p.r_, type);
-  assert(p.rev_);
+  p->fwd_ = fftw_plan_dft_r2c_1d(n, p->r_, p->c_, type);
+  assert(p->fwd_);
+  p->rev_ = fftw_plan_dft_c2r_1d(n, p->c_, p->r_, type);
+  assert(p->rev_);
   
   //
   // complex -> complex
   //
-  p.cc1_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
-  assert(p.cc1_);
-  p.cc2_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
-  assert(p.cc2_);
-  p.cfwd_ = fftw_plan_dft_1d(n, p.cc1_, p.cc2_, FFTW_FORWARD, type);
-  assert(p.cfwd_);
-  p.crev_ = fftw_plan_dft_1d(n, p.cc2_, p.cc1_, FFTW_BACKWARD, type);
-  assert(p.crev_);
+  p->cc1_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
+  assert(p->cc1_);
+  p->cc2_ = (fftw_complex*) fftw_malloc(n * sizeof(fftw_complex));
+  assert(p->cc2_);
+  p->cfwd_ = fftw_plan_dft_1d(n, p->cc1_, p->cc2_, FFTW_FORWARD, type);
+  assert(p->cfwd_);
+  p->crev_ = fftw_plan_dft_1d(n, p->cc2_, p->cc1_, FFTW_BACKWARD, type);
+  assert(p->crev_);
 
   flock(lockfd, LOCK_UN);
   close(lockfd);
 
-  plans.push_back(p);
+  assert(nplans+1 < 1000);
+  
+  plans[nplans] = p;
+  __sync_synchronize();
+  nplans += 1;
 
-  if(0){
+  if(0 && getpid() == plan_master_pid){
     double t1 = now();
-    fprintf(stderr, "miss pid=%d master=%d n=%d t=%.3f, %s\n",
-            getpid(), plan_master_pid, n, t1 - t0, why);
+    fprintf(stderr, "miss pid=%d master=%d n=%d t=%.3f total=%d, %s\n",
+            getpid(), plan_master_pid, n, t1 - t0, nplans, why);
   }
 
   plansmu.unlock();
+
+  return p;
 }
 
 //
@@ -127,7 +157,8 @@ get_plan(int n, Plan &p, const char *why)
 // output has (block / 2) + 1 points.
 //
 std::vector<std::complex<double>>
-one_fft(const std::vector<double> &samples, int i0, int block, const char *why)
+one_fft(const std::vector<double> &samples, int i0, int block,
+        const char *why, Plan *p)
 {
   assert(i0 >= 0);
   assert(block > 1);
@@ -135,23 +166,40 @@ one_fft(const std::vector<double> &samples, int i0, int block, const char *why)
   int nsamples = samples.size();
   int nbins = (block / 2) + 1;
 
-  Plan p;
-  get_plan(block, p, why);
-  fftw_plan m_plan = p.fwd_;
+  if(p){
+    assert(p->n_ == block);
+    p->uses_ += 1;
+  } else {
+    p = get_plan(block, why);
+  }
+  fftw_plan m_plan = p->fwd_;
 
-  double *m_in = (double *) fftw_malloc(sizeof(double) * p.n_);
-  assert(m_in);
-  fftw_complex *m_out = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                     ((p.n_ / 2) + 1));
-  assert(m_out);
+#if TIMING
+  double t0 = now();
+#endif
 
-  for(int i = 0; i < block; i++){
-    if(i0 + i < nsamples){
-      m_in[i] = samples[i0 + i];
-    } else {
-      m_in[i] = 0;
+  assert(samples.size() - i0 >= block);
+
+  int m_in_allocated = 0;
+  double *m_in = (double*) samples.data() + i0;
+
+  if((((unsigned long long)m_in) % 16) != 0){
+    // m_in must be on a 16-byte boundary for FFTW.
+    m_in = (double *) fftw_malloc(sizeof(double) * p->n_);
+    assert(m_in);
+    m_in_allocated = 1;
+    for(int i = 0; i < block; i++){
+      if(i0 + i < nsamples){
+        m_in[i] = samples[i0 + i];
+      } else {
+        m_in[i] = 0;
+      }
     }
   }
+
+  fftw_complex *m_out = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
+                                                     ((p->n_ / 2) + 1));
+  assert(m_out);
 
   fftw_execute_dft_r2c(m_plan, m_in, m_out);
 
@@ -160,12 +208,16 @@ one_fft(const std::vector<double> &samples, int i0, int block, const char *why)
   for(int bi = 0; bi < nbins; bi++){
     double re = m_out[bi][0];
     double im = m_out[bi][1];
-    std::complex<double> c(re, im);
-    out[bi] = c;
+    out[bi] = std::complex<double>(re, im);
   }
 
-  fftw_free(m_in);
+  if(m_in_allocated)
+    fftw_free(m_in);
   fftw_free(m_out);
+
+#if TIMING
+  p->time_ += now() - t0;
+#endif
 
   return out;
 }
@@ -188,18 +240,21 @@ ffts(const std::vector<double> &samples, int i0, int block, const char *why)
     bins[si].resize(nbins);
   }
 
-  Plan p;
-  get_plan(block, p, why);
-  fftw_plan m_plan = p.fwd_;
+  Plan *p = get_plan(block, why);
+  fftw_plan m_plan = p->fwd_;
 
-  // allocate our own b/c using p.m_in and p.m_out isn't thread-safe.
-  double *m_in = (double *) fftw_malloc(sizeof(double) * p.n_);
+#if TIMING
+  double t0 = now();
+#endif
+
+  // allocate our own b/c using p->m_in and p->m_out isn't thread-safe.
+  double *m_in = (double *) fftw_malloc(sizeof(double) * p->n_);
   fftw_complex *m_out = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                     ((p.n_ / 2) + 1));
+                                                     ((p->n_ / 2) + 1));
   assert(m_in && m_out);
 
-  // double *m_in = p.r_;
-  // fftw_complex *m_out = p.c_;
+  // double *m_in = p->r_;
+  // fftw_complex *m_out = p->c_;
 
   for(int si = 0; si < nblocks; si++){
     int off = i0 + si * block;
@@ -225,6 +280,10 @@ ffts(const std::vector<double> &samples, int i0, int block, const char *why)
   fftw_free(m_in);
   fftw_free(m_out);
 
+#if TIMING
+  p->time_ += now() - t0;
+#endif
+
   return bins;
 }
 
@@ -241,9 +300,12 @@ one_fft_c(const std::vector<double> &samples, int i0, int block, const char *why
   
   int nsamples = samples.size();
 
-  Plan p;
-  get_plan(block, p, why);
-  fftw_plan m_plan = p.cfwd_;
+  Plan *p = get_plan(block, why);
+  fftw_plan m_plan = p->cfwd_;
+
+#if TIMING
+  double t0 = now();
+#endif
 
   fftw_complex *m_in  = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
   fftw_complex *m_out = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
@@ -274,6 +336,62 @@ one_fft_c(const std::vector<double> &samples, int i0, int block, const char *why
   fftw_free(m_in);
   fftw_free(m_out);
 
+#if TIMING
+  p->time_ += now() - t0;
+#endif
+
+  return out;
+}
+
+std::vector<std::complex<double>>
+one_fft_cc(const std::vector<std::complex<double>> &samples, int i0, int block, const char *why)
+{
+  assert(i0 >= 0);
+  assert(block > 1);
+  
+  int nsamples = samples.size();
+
+  Plan *p = get_plan(block, why);
+  fftw_plan m_plan = p->cfwd_;
+
+#if TIMING
+  double t0 = now();
+#endif
+
+  fftw_complex *m_in  = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
+  fftw_complex *m_out = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
+  assert(m_in && m_out);
+
+  for(int i = 0; i < block; i++){
+    if(i0 + i < nsamples){
+      m_in[i][0] = samples[i0 + i].real();
+      m_in[i][1] = samples[i0 + i].imag();
+    } else {
+      m_in[i][0] = 0;
+      m_in[i][1] = 0;
+    }
+  }
+
+  fftw_execute_dft(m_plan, m_in, m_out);
+
+  std::vector<std::complex<double>> out(block);
+
+  //double norm = 1.0 / sqrt(block);
+  for(int bi = 0; bi < block; bi++){
+    double re = m_out[bi][0];
+    double im = m_out[bi][1];
+    std::complex<double> c(re, im);
+    //c *= norm;
+    out[bi] = c;
+  }
+    
+  fftw_free(m_in);
+  fftw_free(m_out);
+
+#if TIMING
+  p->time_ += now() - t0;
+#endif
+
   return out;
 }
 
@@ -282,9 +400,12 @@ one_ifft_cc(const std::vector<std::complex<double>> &bins, const char *why)
 {
   int block = bins.size();
 
-  Plan p;
-  get_plan(block, p, why);
-  fftw_plan m_plan = p.crev_;
+  Plan *p = get_plan(block, why);
+  fftw_plan m_plan = p->crev_;
+
+#if TIMING
+  double t0 = now();
+#endif
 
   fftw_complex *m_in = (fftw_complex*) fftw_malloc(block * sizeof(fftw_complex));
   fftw_complex *m_out = (fftw_complex *) fftw_malloc(block * sizeof(fftw_complex));
@@ -312,6 +433,10 @@ one_ifft_cc(const std::vector<std::complex<double>> &bins, const char *why)
   fftw_free(m_in);
   fftw_free(m_out);
 
+#if TIMING
+  p->time_ += now() - t0;
+#endif
+
   return out;
 }
 
@@ -321,13 +446,16 @@ one_ifft(const std::vector<std::complex<double>> &bins, const char *why)
   int nbins = bins.size();
   int block = (nbins - 1) * 2;
 
-  Plan p;
-  get_plan(block, p, why);
-  fftw_plan m_plan = p.rev_;
+  Plan *p = get_plan(block, why);
+  fftw_plan m_plan = p->rev_;
+
+#if TIMING
+  double t0 = now();
+#endif
 
   fftw_complex *m_in = (fftw_complex *) fftw_malloc(sizeof(fftw_complex) *
-                                                    ((p.n_ / 2) + 1));
-  double *m_out = (double *) fftw_malloc(sizeof(double) * p.n_);
+                                                    ((p->n_ / 2) + 1));
+  double *m_out = (double *) fftw_malloc(sizeof(double) * p->n_);
 
   for(int bi = 0; bi < nbins; bi++){
     double re = bins[bi].real();
@@ -345,6 +473,10 @@ one_ifft(const std::vector<std::complex<double>> &bins, const char *why)
 
   fftw_free(m_in);
   fftw_free(m_out);
+
+#if TIMING
+  p->time_ += now() - t0;
+#endif
 
   return out;
 }
@@ -416,4 +548,22 @@ hilbert_shift(const std::vector<double> &x, double hz0, double hz1, int rate)
   }
 
   return ret;
+}
+
+void
+fft_stats()
+{
+  for(int i = 0; i < nplans; i++){
+    Plan *p = plans[i];
+    printf("%-13s %6d %9d %6.3f\n",
+           p->why_,
+           p->n_,
+           p->uses_,
+#if TIMING
+           p->time_
+#else
+           0.0
+#endif
+           );
+  }
 }

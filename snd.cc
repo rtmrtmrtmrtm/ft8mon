@@ -129,21 +129,22 @@ SoundIn::levels()
 }
 
 //
-// generic open
+// generic open.
+// wanted_rate can be -1.
 //
 SoundIn *
-SoundIn::open(std::string card, std::string chan)
+SoundIn::open(std::string card, std::string chan, int wanted_rate)
 {
   assert(card.size() > 0);
   SoundIn *sin;
 
   if(isdigit(card[0])){
-    sin = new CardSoundIn(atoi(card.c_str()), atoi(chan.c_str()));
+    sin = new CardSoundIn(atoi(card.c_str()), atoi(chan.c_str()), wanted_rate);
   } else if(card == "file"){
-    sin = new FileSoundIn(chan);
+    sin = new FileSoundIn(chan, wanted_rate);
 #ifdef AIRSPYHF
   } else if(card == "airspy"){
-    sin = new AirspySoundIn(chan);
+    sin = new AirspySoundIn(chan, wanted_rate);
 #endif
   } else {
     fprintf(stderr, "SoundIn::open(%s, %s): type not recognized\n", card.c_str(), chan.c_str());
@@ -185,12 +186,13 @@ CardSoundIn::cb(const void *input,
   return 0;
 }
 
-CardSoundIn::CardSoundIn(int card, int chan)
+CardSoundIn::CardSoundIn(int card, int chan, int wanted_rate)
 {
   card_ = card;
   chan_ = chan;
   assert(chan_ >= 0 && chan_ <= 1);
   time_ = -1;
+  rate_ = wanted_rate;
 }
 
 //
@@ -245,12 +247,14 @@ CardSoundIn::start()
 {
   snd_init();
 
+  if(rate_ == -1){
 #ifdef __linux__
-  // RIGblaster only supports 44100 and 48000.
-  rate_ = 48000;
+    // RIGblaster only supports 44100 and 48000.
+    rate_ = 48000;
 #else
-  rate_ = 6000; // on some systems this may need to be 12000
+    rate_ = 12000;
 #endif
+  }
 
 #ifdef __FreeBSD__
   // must read both, otherwise FreeBSD mixes them.
@@ -316,15 +320,23 @@ CardSoundIn::start()
 // or -,megahertz
 // or just serial #
 //
-AirspySoundIn::AirspySoundIn(std::string chan)
+AirspySoundIn::AirspySoundIn(std::string chan, int wanted_rate)
 {
   device_ = 0;
   //hz_ = 1000000.0 * atof(chan.c_str());
   hz_ = 10 * 1000 * 1000;
   air_rate_ = 192 * 1000;;
-  rate_ = 6000;
   time_ = -1;
   count_ = 0;
+  strcpy(hostname_, "???");
+  gethostname(hostname_, sizeof(hostname_));
+  hostname_[sizeof(hostname_)-1] = '\0';
+
+  if(wanted_rate == -1){
+    rate_ = 12000;
+  } else {
+    rate_ = wanted_rate;
+  }
 
   int comma = chan.find(",");
   if(comma >= 0){
@@ -344,11 +356,27 @@ AirspySoundIn::AirspySoundIn(std::string chan)
       exit(1);
     }
   }
+  
+  serial_ = get_serial();
 
   if (airspyhf_set_samplerate(device_, air_rate_) != AIRSPYHF_SUCCESS) {
     fprintf(stderr, "airspyhf_set_samplerate(%d) failed\n", air_rate_);
     exit(1);
   }
+
+#if 0
+  if (airspyhf_set_hf_lna(device_, 1) != AIRSPYHF_SUCCESS) {
+    fprintf(stderr, "airspyhf_set_hf_lna(1) failed\n");
+    exit(1);
+  }
+#endif
+
+#if 0
+  if (airspyhf_set_hf_att(device_, 5) != AIRSPYHF_SUCCESS) {
+    fprintf(stderr, "airspyhf_set_hf_att(5) failed\n");
+    exit(1);
+  }
+#endif
 
   // allocate a 60-second circular buffer
   n_ = rate_ * 60;
@@ -376,29 +404,46 @@ AirspySoundIn::AirspySoundIn(std::string chan)
   filter_ = firfilt_crcf_create(h, h_len);
 }
 
+unsigned long long
+AirspySoundIn::get_serial()
+{
+  airspyhf_read_partid_serialno_t sn;
+  airspyhf_board_partid_serialno_read(device_, &sn);
+  unsigned long long x;
+  x = ((unsigned long long) sn.serial_no[0]) << 32;
+  x |= (unsigned long long) sn.serial_no[1];
+  return x;
+}
+
 int
 AirspySoundIn::set_freq(int hz)
 {
-  if( airspyhf_set_freq(device_, hz) != AIRSPYHF_SUCCESS ) {
+  if(hz > 31000000 && hz < 60000000){
+    // Airspy HF+ specifications say 0.5kHz .. 31 MHz and 60..260 MHz.
+    // Thus not the 6-meter band.
+    fprintf(stderr, "airspy %llx: unsupported frequency %d\n", serial_, hz);
+  }
+
+  int ret = airspyhf_set_freq(device_, hz);
+  if(ret != AIRSPYHF_SUCCESS){
     fprintf(stderr, "airspyhf_set_freq(%d) failed.\n", hz);
     exit(1);
   }
   hz_ = hz;
+  
   return hz;
 }
 
 void
 AirspySoundIn::start()
 {
-  if( airspyhf_start(device_, cb1, this) != AIRSPYHF_SUCCESS ) {
+  int ret = airspyhf_start(device_, cb1, this);
+  if(ret != AIRSPYHF_SUCCESS){
     fprintf(stderr, "airspyhf_start() failed.\n");
     exit(1);
   }
 
-  if( airspyhf_set_freq(device_, hz_) != AIRSPYHF_SUCCESS ) {
-    fprintf(stderr, "airspyhf_set_freq(%d) failed.\n", hz_);
-    exit(1);
-  }
+  set_freq(hz_);
 }
 
 int
@@ -418,25 +463,26 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
   // each sample is an I/Q pair of 32-bit floats
 
   if(transfer->dropped_samples){
-    fprintf(stderr, "airspy dropped_samples %d\n", (int)transfer->dropped_samples);
+    fprintf(stderr, "airspy %s %llx (%.3f MHz) dropped_samples %d, sample_count %d\n",
+            hostname_,
+            serial_,
+            hz_ / 1000000.0,
+            (int)transfer->dropped_samples,
+            (int)transfer->sample_count);
   }
 
-#if 0
-  if(time_ < 0){
-    time_ = now();
-  } else {
-    time_ += (transfer->sample_count + transfer->dropped_samples) * (1.0 / air_rate_);
-  }
-#else
   time_ = now();
-#endif
 
   airspyhf_complex_float_t *buf = transfer->samples;
-  for(int i = 0; i < transfer->sample_count; i++){
+  for(int i = 0; i < transfer->sample_count + transfer->dropped_samples; i++){
     // low-pass filter, preparatory to rate reduction.
     liquid_float_complex x, y;
-    x.real = buf[i].re;
-    x.imag = buf[i].im;
+    if(i < transfer->sample_count){
+      x.real = buf[i].re;
+      x.imag = buf[i].im;
+    } else {
+      x.real = x.imag = 0;
+    }
     firfilt_crcf_push(filter_, x);
     firfilt_crcf_execute(filter_, &y);
 
@@ -446,9 +492,10 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
         buf_[wi_] = std::complex<double>(y.real, y.imag);
         wi_ = (wi_ + 1) % n_;
       } else {
-        fprintf(stderr, "CardSoundIn::cb buf_ overflow\n");
-        sleep(20); // XXX
-        exit(1); // XXX
+#if 0
+        fprintf(stderr, "AirspySoundIn::cb buf_ overflow, serial=%llx\n",
+                serial_);
+#endif
         break;
       }
     }
@@ -640,15 +687,15 @@ SoundOut::write(const std::vector<double> &v)
 //
 
 extern "C" {
-  void *ext_snd_open(const char *card, const char *chan);
+  void *ext_snd_open(const char *card, const char *chan, int wanted_rate);
   int ext_snd_read(void *, double *, int, double *);
   int ext_set_freq(void *, int);
 }
 
 void *
-ext_snd_open(const char *card, const char *chan)
+ext_snd_open(const char *card, const char *chan, int wanted_rate)
 {
-  SoundIn *sin = SoundIn::open(card, chan);
+  SoundIn *sin = SoundIn::open(card, chan, wanted_rate);
   sin->start();
   return (void *) sin;
 }

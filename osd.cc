@@ -122,19 +122,12 @@ osd_decode(double codeword[174], int depth, int out[91], int *out_depth)
   // indicating how to generate it by xor with each of the 91 plain bits.
 
   // generator matrix, reordered strongest codeword bit first.
-  int gen1[174][91];
-  for(int ii = 0; ii < 174; ii++){
-    int i = which[ii];
-    for(int j = 0; j < 91; j++){
-      gen1[ii][j] = gen_sys[i][j];
-    }
-  }
-
   int b[174][91*2];
   for(int i = 0; i < 174; i++){
+    int ii = which[i];
     for(int j = 0; j < 91*2; j++){
       if(j < 91){
-        b[i][j] = gen1[i][j];
+        b[i][j] = gen_sys[ii][j];
       } else {
         b[i][j] = 0;
       }

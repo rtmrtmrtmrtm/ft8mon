@@ -117,3 +117,16 @@ goertzel(std::vector<double> v, int rate, int i0, int n, double hz)
   return std::complex<double>(re, im);
 }
 
+double
+vmax(const std::vector<double> &v)
+{
+  double mx = 0;
+  int got = 0;
+  for(int i = 0; i < v.size(); i++){
+    if(got == 0 || v[i] > mx){
+      got = 1;
+      mx = v[i];
+    }
+  }
+  return mx;
+}

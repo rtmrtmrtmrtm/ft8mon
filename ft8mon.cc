@@ -19,6 +19,7 @@
 #include "util.h"
 #include "unpack.h"
 #include "ft8.h"
+#include "fft.h"
 
 std::mutex cycle_mu;
 volatile int cycle_count;
@@ -86,10 +87,11 @@ main(int argc, char *argv[])
   fftw_type = FFTW_ESTIMATE; // rather than FFTW_MEASURE
 
   extern int nthreads;
-  nthreads = 4; // use four cores in parallel
+  nthreads = 1; // multi-core?
   
   if(argc == 4 && strcmp(argv[1], "-card") == 0){
-    SoundIn *sin = SoundIn::open(argv[2], argv[3]);
+    int wanted_rate = 12000;
+    SoundIn *sin = SoundIn::open(argv[2], argv[3], wanted_rate);
     sin->start();
     int rate = sin->rate();
 
@@ -136,8 +138,9 @@ main(int argc, char *argv[])
 
           entry(samples.data(), samples.size(), nominal_start, rate,
                 150,
-                2900,
-                hints, hints, budget, budget, hcb);
+                3600, // 2900,
+                hints, hints, budget, budget, hcb,
+                0, (struct cdecode *) 0);
         }
 
         sleep(2);
@@ -145,7 +148,7 @@ main(int argc, char *argv[])
       usleep(100 * 1000); // 0.1 seconds
     }
   } else if(argc == 4 && strcmp(argv[1], "-levels") == 0){
-    SoundIn *sin = SoundIn::open(argv[2], argv[3]);
+    SoundIn *sin = SoundIn::open(argv[2], argv[3], 12000);
     sin->start();
     sin->levels();
   } else if(argc >= 3 && strcmp(argv[1], "-file") == 0){
@@ -155,9 +158,12 @@ main(int argc, char *argv[])
       std::vector<double> s = readwav(argv[ii], rate);
       entry(s.data(), s.size(), 0.5 * rate, rate,
             150,
-            2900,
-            hints, hints, budget, budget, hcb);
+            3600, // 2900,
+            hints, hints, budget, budget, hcb,
+            0, (struct cdecode *) 0);
     }
+    extern void fft_stats();
+    //fft_stats();
   } else if(argc == 2 && strcmp(argv[1], "-list") == 0){
     snd_list();
   } else {

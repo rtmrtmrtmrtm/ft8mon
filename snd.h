@@ -24,7 +24,7 @@ public:
   virtual std::vector<double> get(int n, double &t0, int latest) = 0;
   void levels();
   virtual int set_freq(int) { return -1; }
-  static SoundIn *open(std::string card, std::string chan);
+  static SoundIn *open(std::string card, std::string chan, int wanted_rate);
 };
 
 class CardSoundIn : public SoundIn {
@@ -43,7 +43,7 @@ class CardSoundIn : public SoundIn {
   double time_; // of most recent sample, buf_[wi_-1]
 
  public:
-  CardSoundIn(int card, int chan);
+  CardSoundIn(int card, int chan, int wanted_rate);
   void start();
   std::vector<double> get(int n, double &t0, int latest);
   int rate() { return rate_; }
@@ -63,8 +63,13 @@ private:
   int i_;
   double t_; // unix time of samples_[i_];
 public:
-  FileSoundIn(std::string filename) {
+  FileSoundIn(std::string filename, int wanted_rate) {
     samples_ = readwav(filename.c_str(), rate_);
+    if(wanted_rate != -1 && wanted_rate != rate_){
+      fprintf(stderr, "FileSoundIn(%s, %d) but rate %d\n",
+              filename.c_str(), wanted_rate, rate_);
+      exit(1);
+    }
     i_ = 0;
     t_ = now();
   }
@@ -96,11 +101,13 @@ public:
 class AirspySoundIn : public SoundIn {
  private:
   struct airspyhf_device* device_;
+  unsigned long long serial_;
   unsigned int hz_;
   int air_rate_; // 192000
   int rate_; // 12000
   double time_; // of most recent sample, buf_[wi_-1]
   long long count_; // of samples, for rate reduction.
+  char hostname_[64];
 
   firfilt_crcf filter_;
 
@@ -110,8 +117,10 @@ class AirspySoundIn : public SoundIn {
   volatile int wi_;
   volatile int ri_;
 
+  unsigned long long get_serial();
+
  public:
-  AirspySoundIn(std::string chan);
+  AirspySoundIn(std::string chan, int wanted_rate);
   ~AirspySoundIn() { firfilt_crcf_destroy(filter_); }
   void start();
   std::vector<double> get(int n, double &t0, int latest);
