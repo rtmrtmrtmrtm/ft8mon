@@ -43,23 +43,22 @@
 // total transmission time is 12.64 seconds
 
 // tunable parameters
-int nthreads = 2; // number of parallel threads, for multi-core
+int nthreads = 8; // number of parallel threads, for multi-core
 int npasses_one = 3;  // number of spectral subtraction passes
 int npasses_two = 3;  // number of spectral subtraction passes
 int ldpc_iters = 25; // how hard LDPC decoding should work
 int snr_win = 7; // averaging window, in symbols, for SNR conversion
-int snr_how = 0; // technique to measure "N" for SNR. 0 means median of the 8 tones.
-int best_in_noise = 1;
+int snr_how = 3; // technique to measure "N" for SNR. 0 means median of the 8 tones.
 double shoulder200 = 10; // for 200 sps bandpass filter
 double shoulder200_extra = 0.0; // for bandpass filter
 double second_hz_win = 3.5; // +/- hz
-int second_hz_fracs = 8; // divide total window into this many pieces
+int second_hz_n = 8; // divide total window into this many pieces
 double second_off_win = 0.5; // +/- search window in symbol-times
-int second_off_fracs = 10;
-double third_hz_inc = 0.25;
+int second_off_n = 10;
+int third_hz_n = 3;
 double third_hz_win = 0.25;
-double third_off_inc = 0.05;
-double third_off_win = 0.1;
+int third_off_n = 4;
+double third_off_win = 0.075;
 double log_tail = 0.1;
 double log_rate = 8.0;
 int problt_how_noise = 0;
@@ -67,44 +66,49 @@ int problt_how_sig = 0;
 int use_apriori = 1;
 int use_hints = 2; // 1 means use all hints, 2 means just CQ hints
 int win_type = 1;
-int osd_depth = 6; // don't increase beyond 6, produces too much garbage
+int osd_depth = 0; // 6; // don't increase beyond 6, produces too much garbage
 int osd_ldpc_thresh = 70; // demand this many correct LDPC parity bits before OSD
 int ncoarse = 1; // number of offsets per hz produced by coarse()
 int ncoarse_blocks = 1;
 double tminus = 2.2; // start looking at 0.5 - tminus seconds
 double tplus = 2.4;
-int coarse_off_fracs = 4;
-int coarse_hz_fracs = 4;
+int coarse_off_n = 4;
+int coarse_hz_n = 4;
 double already_hz = 27;
 double overlap = 20;
 int overlap_edges = 0;
 double nyquist = 0.925;
 int oddrate = 1;
 double pass0_frac = 1.0;
-int reduce_len = 5;
 int reduce_how = 2;
 double go_extra = 3.5;
-double reduce_margin = 0.06;
 int do_reduce = 1;
 int pass_threshold = 1;
-int strength_how = 1;
+int strength_how = 4;
+int known_strength_how = 7;
 int coarse_strength_how = 6;
 double reduce_shoulder = -1;
+double reduce_factor = 0.25;
+double reduce_extra = 0;
 double coarse_all = -1;
 int second_count = 3;
 int soft_phase_win = 2;
 double subtract_ramp = 0.11;
 extern int fftw_type; // fft.cc. MEASURE=0, ESTIMATE=64, PATIENT=32
+int soft_ones = 2;
 int soft_pairs = 1;
 int soft_triples = 1;
 int do_second = 1;
 int do_fine_hz = 1;
 int do_fine_off = 1;
-int do_third = 0;
+int do_third = 2;
 double fine_thresh = 0.19;
 int fine_max_off = 2;
 int fine_max_tone = 4;
 int known_sparse = 1;
+double c_soft_weight = 7;
+int c_soft_win = 2;
+int bayes_how = 1;
 
 //
 // return a Hamming window of length n.
@@ -228,6 +232,7 @@ check_crc(const int a91[91])
 class Stats {
 public:
   std::vector<double> a_;
+  double sum_;
   bool finalized_;
   double mean_; // cached
   double stddev_; // cached
@@ -235,10 +240,11 @@ public:
   int how_;
   
 public:
-  Stats(int how) : finalized_(false), how_(how) { }
+  Stats(int how) : sum_(0), finalized_(false), how_(how) { }
 
   void add(double x) {
     a_.push_back(x);
+    sum_ += x;
     finalized_ = false;
   }
 
@@ -246,11 +252,7 @@ public:
     finalized_ = true;
     
     int n = a_.size();
-    mean_ = 0.0;
-    for(int i = 0; i < n; i++){
-      mean_ += a_[i];
-    }
-    mean_ /= n;
+    mean_ = sum_ / n;
 
     double var = 0;
     double bsum = 0;
@@ -482,8 +484,8 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
 {
   int costas[] = { 3, 1, 4, 0, 6, 5, 2 };
 
-  assert(si0 >= 0 && si0+72+8 <= bins.size());
-  assert(bi0 >= 0 && bi0 + 8 <= bins[0].size());
+  assert(si0 >= 0 && si0+72+8 <= (int) bins.size());
+  assert(bi0 >= 0 && bi0 + 8 <= (int) bins[0].size());
 
   double sig = 0.0;
   double noise = 0.0;
@@ -519,6 +521,7 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
       }
     }
   } else {
+    // coarse_all = -1
     // just costas symbols
     for(int si = 0; si < 7; si++){
       for(int bi = 0; bi < 8; bi++){
@@ -548,6 +551,7 @@ one_coarse_strength(const ffts_t &bins, int bi0, int si0)
   } else if(coarse_strength_how == 5){
     return sig / (sig + noise);
   } else if(coarse_strength_how == 6){
+    // this is it.
     return sig / noise;
   } else {
     assert(0);
@@ -591,7 +595,7 @@ coarse(const ffts_t &bins, int si0, int si1)
   
   for(int bi = min_bin; bi < max_bin && bi+8 <= nbins; bi++){
     std::vector<Strength> sv;
-    for(int si = si0; si < si1 && si + 79 < bins.size(); si++){
+    for(int si = si0; si < si1 && si + 79 < (int) bins.size(); si++){
       double s = one_coarse_strength(bins, bi, si);
       Strength st;
       st.strength_ = s;
@@ -612,7 +616,7 @@ coarse(const ffts_t &bins, int si0, int si1)
     strengths.push_back(sv[0]);
 
     int nn = 1;
-    for(int i = 1; nn < ncoarse && i < sv.size(); i++){
+    for(int i = 1; nn < ncoarse && i < (int) sv.size(); i++){
       if(std::abs(sv[i].off_ - sv[0].off_) > ncoarse_blocks*block){
         strengths.push_back(sv[i]);
         nn++;
@@ -641,59 +645,62 @@ reduce_rate(const std::vector<double> &a, double hz0, double hz1,
   // stop bands are 0..hz00 and hz11..nyquist.
   double hz00, hz11;
 
+  hz0 = std::max(0.0, hz0 - reduce_extra);
+  hz1 = std::min(arate / 2.0, hz1 + reduce_extra);
+
   if(reduce_shoulder > 0){
     hz00 = hz0 - reduce_shoulder;
     hz11 = hz1 + reduce_shoulder;
   } else {
     double mid = (hz0 + hz1) / 2;
-    hz00 = mid - (brate / 4.0);
-    hz11 = mid + (brate / 4.0);
+    hz00 = mid - (brate * reduce_factor);
+    hz00 = std::min(hz00, hz0);
+    hz11 = mid + (brate * reduce_factor);
+    hz11 = std::max(hz11, hz1);
   }
 
-  int len = a.size();
-  std::vector<std::complex<double>> bins = one_fft(a, 0, len, "reduce_rate1", 0);
-  int nbins = bins.size();
-  double bin_hz = arate / (double) len;
+  int alen = a.size();
+  std::vector<std::complex<double>> bins1 = one_fft(a, 0, alen,
+                                                    "reduce_rate1", 0);
+  int nbins1 = bins1.size();
+  double bin_hz = arate / (double) alen;
 
   if(reduce_how == 2){
     // band-pass filter the FFT output.
-    bins = fbandpass(bins, bin_hz,
-                     hz00,
-                     hz0,
-                     hz1,
-                     hz11);
+    bins1 = fbandpass(bins1, bin_hz,
+                      hz00,
+                      hz0,
+                      hz1,
+                      hz11);
   }
   
   if(reduce_how == 3){
-    for(int i = 0; i < nbins; i++){
+    for(int i = 0; i < nbins1; i++){
       if(i < (hz0 / bin_hz)){
-        bins[i] = 0;
+        bins1[i] = 0;
       } else if(i > (hz1 / bin_hz)){
-        bins[i] = 0;
+        bins1[i] = 0;
       }
     }
   }
 
   // shift down.
   int omid = ((hz0 + hz1) / 2) / bin_hz;
-  int nmid = (brate / 4) / bin_hz;
+  int nmid = (brate / 4.0) / bin_hz;
 
   int delta = omid - nmid; // amount to move down
-  assert(delta < nbins);
-  if(delta > 0){
-    for(int i = 0; i < nbins-delta; i++){
-      bins[i] = bins[i + delta];
-    }
-    for(int i = nbins-delta; i < nbins; i++){
-      bins[i] = 0;
+  assert(delta < nbins1);
+  int blen = round(alen * (brate / (double) arate));
+  std::vector<std::complex<double>> bbins(blen / 2 + 1);
+  for(int i = 0; i < (int) bbins.size(); i++){
+    if(delta > 0){
+      bbins[i] = bins1[i + delta];
+    } else {
+      bbins[i] = bins1[i];
     }
   }
 
   // use ifft to reduce the rate.
-  int blen = round(a.size() * (brate / (double) arate));
-  std::vector<std::complex<double>> bbins(blen / 2 + 1);
-  for(int i = 0; i < bbins.size(); i++)
-    bbins[i] = bins[i];
   std::vector<double> vvv = one_ifft(bbins, "reduce_rate2");
 
   delta_hz = delta * bin_hz;
@@ -712,21 +719,26 @@ go(int npasses)
             min_hz_, max_hz_, max_hz_ - min_hz_, rate_);
   }
 
-  // quantize the number of samples so as to be able
-  // to re-use FFTW plans.
-  int quantum = 10;
-  if(samples_.size() > 100000){
-    quantum = 1000;
-  } else if(samples_.size() > 20000){
-    quantum = 200;
-  } else if(samples_.size() > 10000){
-    quantum = 100;
+  // trim to make samples_ a good size for FFTW.
+  int nice_sizes[] = { 18000, 18225, 36000, 36450,
+    54000, 54675, 72000, 72900,
+    144000, 145800, 216000, 218700,
+    0 };
+  int nice = -1;
+  for(int i = 0; nice_sizes[i]; i++){
+    int sz = nice_sizes[i];
+    if(fabs(samples_.size() - sz) < 0.05 * samples_.size()){
+      nice = sz;
+      break;
+    }
   }
-  int excess = samples_.size() % quantum;
-  samples_.resize(samples_.size() - excess);
+  if(nice != -1){
+    samples_.resize(nice);
+  }
+
+  assert(min_hz_ >= 0 && max_hz_ + 50 <= rate_/2);
 
   // can we reduce the sample rate?
-  int rates[] = { 500, 1000, 1500, 2000, 3000, 4000, 6000, -1 };
   int nrate = -1;
   for(int xrate = 100; xrate < rate_; xrate += 100){
     if(xrate < rate_ && (oddrate || (rate_ % xrate) == 0)){
@@ -737,18 +749,28 @@ go(int npasses)
     }
   }
 
-  if(do_reduce && nrate > 0 && nrate < rate_){
+  if(do_reduce && nrate > 0 && nrate < rate_ * 0.75){
     // filter and reduce the sample rate from rate_ to nrate.
 
     double t0 = now();
+    int osize = samples_.size();
+    
     double delta_hz; // how much it moved down
     samples_ = reduce_rate(samples_,
                            min_hz_-3.1-go_extra,
                            max_hz_+50-3.1+go_extra,
                            rate_, nrate, delta_hz);
 
+    double t1 = now();
+    if(t1 - t0 > 0.1){
+      fprintf(stderr, "reduce oops, size %d -> %d, rate %d -> %d, took %.2f\n",
+              osize,
+              (int) samples_.size(),
+              rate_,
+              nrate,
+              t1 - t0);
+    }
     if(0){
-      double t1 = now();
       fprintf(stderr, "%.0f..%.0f, range %.0f, rate %d -> %d, delta hz %.0f, %.6f sec\n",
               min_hz_, max_hz_,
               max_hz_ - min_hz_,
@@ -759,7 +781,7 @@ go(int npasses)
       down_hz_ = delta_hz; // to adjust hz for Python.
       min_hz_ -= down_hz_;
       max_hz_ -= down_hz_;
-      for(int i = 0; i < prevdecs_.size(); i++){
+      for(int i = 0; i < (int) prevdecs_.size(); i++){
         prevdecs_[i].hz0 -= delta_hz;
         prevdecs_[i].hz1 -= delta_hz;
       }
@@ -774,12 +796,10 @@ go(int npasses)
 
   int block = blocksize(rate_);
 
-  double bin_hz = rate_ / (double) block;
-
   // start_ is the sample number of 0.5 seconds, the nominal start time.
 
   // make sure there's at least tplus*rate_ samples after the end.
-  if(start_ + tplus*rate_ + 79 * block > samples_.size()){
+  if(start_ + tplus*rate_ + 79 * block + block > samples_.size()){
     int need = start_ + tplus*rate_ + 79 * block - samples_.size();
 
     // round up to a whole second, to ease fft plan caching.
@@ -807,7 +827,7 @@ go(int npasses)
   nsamples_ = samples_;
 
   int any = 0;
-  for(int i = 0; i < prevdecs_.size(); i++){
+  for(int i = 0; i < (int) prevdecs_.size(); i++){
     auto d = prevdecs_[i];
     if(d.hz0 >= min_hz_ && d.hz0 <= max_hz_){
       // reconstruct correct 79 symbols from LDPC output.
@@ -853,22 +873,21 @@ go(int npasses)
     std::vector<std::complex<double>> bins = one_fft(samples_, 0, samples_.size(),
                                                      "go1", 0);
 
-    for(int hz_frac_i = 0; hz_frac_i < coarse_hz_fracs; hz_frac_i++){
+    for(int hz_frac_i = 0; hz_frac_i < coarse_hz_n; hz_frac_i++){
       // shift down by hz_frac
-      double hz_frac = hz_frac_i * (6.25 / coarse_hz_fracs);
+      double hz_frac = hz_frac_i * (6.25 / coarse_hz_n);
       std::vector<double> samples1;
       if(hz_frac_i == 0){
         samples1 = samples_;
       } else {
-        samples1 = fft_shift_f(bins, samples_.size(),
-                               rate_, hz_frac);
+        samples1 = fft_shift_f(bins, rate_, hz_frac);
       }
       
-      for(int off_frac_i = 0; off_frac_i < coarse_off_fracs; off_frac_i++){
-        int off_frac = off_frac_i * (block / coarse_off_fracs);
+      for(int off_frac_i = 0; off_frac_i < coarse_off_n; off_frac_i++){
+        int off_frac = off_frac_i * (block / coarse_off_n);
         ffts_t bins = ffts(samples1, off_frac, block, "go2");
         std::vector<Strength> oo = coarse(bins, si0, si1);
-        for(int i = 0; i < oo.size(); i++){
+        for(int i = 0; i < (int) oo.size(); i++){
           oo[i].hz_ += hz_frac;
           oo[i].off_ += off_frac;
         }
@@ -884,10 +903,10 @@ go(int npasses)
               { return a.strength_ > b.strength_; } );
     
     char already[2000]; // XXX
-    for(int i = 0; i < sizeof(already)/sizeof(already[0]); i++)
+    for(int i = 0; i < (int)(sizeof(already)/sizeof(already[0])); i++)
       already[i] = 0;
     
-    for(int ii = 0; ii < order.size(); ii++){
+    for(int ii = 0; ii < (int) order.size(); ii++){
       double tt = now();
       if(ii > 0 &&
          tt > deadline &&
@@ -979,32 +998,46 @@ one_strength_known(const std::vector<double> &samples,
 
   double sig = 0;
   double noise = 0;
+
+  double sum7 = 0;
+  std::complex<double> prev = 0;
+  
   for(int si = 0; si < 79; si += known_sparse){
     auto fft = one_fft(samples, off+si*block, block, "one_strength_known", 0);
-
-    for(int bi = 0; bi < 8; bi++){
-      double x = std::abs(fft[bin0+bi]);
-      if(bi == syms[si]){
-        sig += x;
-      } else {
-        noise += x;
+    if(known_strength_how == 7){
+      std::complex<double> c = fft[bin0+syms[si]];
+      if(si > 0){
+        sum7 += std::abs(c - prev);
+      }
+      prev = c;
+    } else {
+      for(int bi = 0; bi < 8; bi++){
+        double x = std::abs(fft[bin0+bi]);
+        if(bi == syms[si]){
+          sig += x;
+        } else {
+          noise += x;
+        }
       }
     }
   }
-  if(strength_how == 0){
+
+  if(known_strength_how == 0){
      return sig - noise;
-  } else if(strength_how == 1){
+  } else if(known_strength_how == 1){
     return sig - noise/7;
-  } else if(strength_how == 2){
+  } else if(known_strength_how == 2){
     return sig / (noise/7);
-  } else if(strength_how == 3){
+  } else if(known_strength_how == 3){
     return sig / (sig + (noise/7));
-  } else if(strength_how == 4){
+  } else if(known_strength_how == 4){
     return sig;
-  } else if(strength_how == 5){
+  } else if(known_strength_how == 5){
     return sig / (sig + noise);
-  } else if(strength_how == 6){
+  } else if(known_strength_how == 6){
     return sig / noise;
+  } else if(known_strength_how == 7){
+    return -sum7;
   } else {
     assert(0);
   }
@@ -1027,7 +1060,7 @@ search_time_fine(const std::vector<double> &samples200,
   // to make it easier to cache fftw plans.
   //
   int len = (offN - off0) + 79*32 + 32;
-  if(off0 + len > samples200.size()){
+  if(off0 + len > (int) samples200.size()){
     // len = samples200.size() - off0;
     // don't provoke random-length FFTs.
     return -1;
@@ -1051,7 +1084,7 @@ search_time_fine(const std::vector<double> &samples200,
 }
 
 int
-search_time_fine_known(const std::vector<double> &samples,
+search_time_fine_known(const std::vector<std::complex<double>> &bins,
                        int rate,
                        const std::vector<int> &syms,
                        int off0, int offN,
@@ -1065,16 +1098,15 @@ search_time_fine_known(const std::vector<double> &samples,
   // nearest FFT bin center.
   double hz0 = round(hz / 6.25) * 6.25;
 
-  // move hz to hz0, so it is centered in a bin.
-  std::vector<std::complex<double>> bins = one_fft(samples, 0, samples.size(), "xxx", 0);
-  std::vector<double> downsamples = fft_shift_f(bins, samples.size(), rate, hz - hz0);
+  // move hz to hz0, so it is centered in a symbol-sized bin.
+  std::vector<double> downsamples = fft_shift_f(bins, rate, hz - hz0);
 
   int best_off = -1;
   int block = blocksize(rate);
   double best_sum = 0.0;
 
   for(int g = off0 ; g <= offN; g += gran){
-    if(g >= 0 && g + 79*block <= downsamples.size()){
+    if(g >= 0 && g + 79*block <= (int) downsamples.size()){
       double sum = one_strength_known(downsamples, rate, syms, hz0, g);
       if(sum > best_sum || best_off == -1){
         best_off = g;
@@ -1097,15 +1129,15 @@ search_time_fine_known(const std::vector<double> &samples,
 //
 std::vector<Strength>
 search_both(const std::vector<double> &samples200,
-            double hz0, int hz_fracs, double hz_win,
-            int off0, int off_fracs, int off_win)
+            double hz0, int hz_n, double hz_win,
+            int off0, int off_n, int off_win)
 {
   assert(hz0 >= 25 - 6.25/2 && hz0 <= 25 + 6.25/2);
 
   std::vector<Strength> strengths;
   
-  double hz_inc = 2 * hz_win / hz_fracs;
-  int off_inc = round(2 * off_win / (double) off_fracs);
+  double hz_inc = 2 * hz_win / hz_n;
+  int off_inc = round(2 * off_win / (double) off_n);
   if(off_inc < 1)
     off_inc = 1;
 
@@ -1137,21 +1169,34 @@ search_both_known(const std::vector<double> &samples,
 
   int off0 = round(off_secs0 * (double) rate);
 
-  int off_inc = third_off_inc * blocksize(rate_);
-  if(off_inc < 1)
-    off_inc = 1;
   int off_win = third_off_win * blocksize(rate_);
   if(off_win < 1)
     off_win = 1;
+  int off_inc = trunc((2.0 * off_win) / (third_off_n - 1.0));
+  if(off_inc < 1)
+    off_inc = 1;
   
   int got_best = 0;
   double best_hz = 0;
   int best_off = 0;
   double best_strength = 0;
 
-  for(double hz = hz0 - third_hz_win; hz <= hz0 + third_hz_win; hz += third_hz_inc){
+  std::vector<std::complex<double>> bins = one_fft(samples, 0, samples.size(), "stfk", 0);
+
+  double hz_start, hz_inc, hz_end;
+  if(third_hz_n > 1){
+    hz_inc = (2.0 * third_hz_win) / (third_hz_n - 1.0);
+    hz_start = hz0 - third_hz_win;
+    hz_end = hz0 + third_hz_win;
+  } else {
+    hz_inc = 1;
+    hz_start = hz0;
+    hz_end = hz0;
+  }
+
+  for(double hz = hz_start; hz <= hz_end + 0.0001; hz += hz_inc){
     double strength = 0;
-    int off = search_time_fine_known(samples, rate, syms,
+    int off = search_time_fine_known(bins, rate, syms,
                                      off0 - off_win, off0 + off_win, hz,
                                      off_inc, strength);
     if(off >= 0 && (got_best == 0 || strength > best_strength)){
@@ -1182,7 +1227,7 @@ fft_shift(const std::vector<double> &samples, int off, int len,
 
   // horrible hack to avoid repeated FFTs on the same input.
   hack_mu_.lock();
-  if(samples.size() == hack_size_ && samples.data() == hack_data_ &&
+  if((int) samples.size() == hack_size_ && samples.data() == hack_data_ &&
      off == hack_off_ && len == hack_len_ &&
      samples[0] == hack_0_ && samples[1] == hack_1_){
     bins = hack_bins_;
@@ -1198,13 +1243,17 @@ fft_shift(const std::vector<double> &samples, int off, int len,
   }
   hack_mu_.unlock();
 
-  return fft_shift_f(bins, len, rate, hz);
+  return fft_shift_f(bins, rate, hz);
 }
 
+//
+// shift down by hz.
+//
 std::vector<double>
-fft_shift_f(const std::vector<std::complex<double>> bins, int len, int rate, double hz)
+fft_shift_f(const std::vector<std::complex<double>> &bins, int rate, double hz)
 {
   int nbins = bins.size();
+  int len = (nbins - 1) * 2;
 
   double bin_hz = rate / (double) len;
   int down = round(hz / bin_hz);
@@ -1226,7 +1275,7 @@ fft_shift_f(const std::vector<std::complex<double>> bins, int len, int rate, dou
 std::vector<double>
 shift200(const std::vector<double> &samples200, int off, int len, double hz)
 {
-  if(std::abs(hz - 25) < 0.001 && off == 0 && len == samples200.size()){
+  if(std::abs(hz - 25) < 0.001 && off == 0 && len == (int) samples200.size()){
     return samples200;
   } else {
     return fft_shift(samples200, off, len, 200, hz - 25.0);
@@ -1302,11 +1351,12 @@ un_gray_code_r(const std::vector<std::vector<double>> &m79)
 // this helps, but why?
 //
 std::vector< std::vector<double> >
-convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
+convert_to_snr(const std::vector< std::vector<double> > &m79)
 {
-  if(how < 0 || win < 0)
+  if(snr_how < 0 || snr_win < 0)
     return m79;
 
+  //
   // for each symbol time, what's its "noise" level?
   //
   std::vector<double> mm(79);
@@ -1318,21 +1368,21 @@ convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
       v[bi] = x;
       sum += x;
     }
-    if(how != 1)
+    if(snr_how != 1)
       std::sort(v.begin(), v.end());
-    if(how == 0){
+    if(snr_how == 0){
       // median
       mm[si] = (v[3] + v[4]) / 2;
-    } else if(how == 1){
+    } else if(snr_how == 1){
       mm[si] = sum / 8;
-    } else if(how == 2){
+    } else if(snr_how == 2){
       // all but strongest tone.
       mm[si] = (v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6]) / 7;
-    } else if(how == 3){
+    } else if(snr_how == 3){
       mm[si] = v[0]; // weakest tone
-    } else if(how == 4){
+    } else if(snr_how == 4){
       mm[si] = v[7]; // strongest tone
-    } else if(how == 5){
+    } else if(snr_how == 5){
       mm[si] = v[6]; // second-strongest tone
     } else {
       mm[si] = 1.0;
@@ -1341,8 +1391,8 @@ convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
 
   // we're going to take a windowed average.
   std::vector<double> winwin;
-  if(win > 0){
-    winwin = blackman(2*win+1);
+  if(snr_win > 0){
+    winwin = blackman(2*snr_win+1);
   } else {
     winwin.push_back(1.0);
   }
@@ -1351,8 +1401,82 @@ convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
     
   for(int si = 0; si < 79; si++){
     double sum = 0;
-    for(int dd = si - win; dd <= si + win; dd++){
-      int wi = dd - (si - win);
+    for(int dd = si - snr_win; dd <= si + snr_win; dd++){
+      int wi = dd - (si - snr_win);
+      if(dd >= 0 && dd < 79){
+        sum += mm[dd] * winwin[wi];
+      } else if(dd < 0){
+        sum += mm[0] * winwin[wi];
+      } else {
+        sum += mm[78] * winwin[wi];
+      }
+    }
+    n79[si].resize(8);
+    for(int bi = 0; bi < 8; bi++){
+      n79[si][bi] = m79[si][bi] / sum;
+    }
+  }
+
+  return n79;
+}
+
+//
+// normalize levels by windowed median.
+// this helps, but why?
+//
+std::vector< std::vector<std::complex<double>> >
+c_convert_to_snr(const std::vector< std::vector<std::complex<double>> > &m79)
+{
+  if(snr_how < 0 || snr_win < 0)
+    return m79;
+
+  //
+  // for each symbol time, what's its "noise" level?
+  //
+  std::vector<double> mm(79);
+  for(int si = 0; si < 79; si++){
+    std::vector<double> v(8);
+    double sum = 0.0;
+    for(int bi = 0; bi < 8; bi++){
+      double x = std::abs(m79[si][bi]);
+      v[bi] = x;
+      sum += x;
+    }
+    if(snr_how != 1)
+      std::sort(v.begin(), v.end());
+    if(snr_how == 0){
+      // median
+      mm[si] = (v[3] + v[4]) / 2;
+    } else if(snr_how == 1){
+      mm[si] = sum / 8;
+    } else if(snr_how == 2){
+      // all but strongest tone.
+      mm[si] = (v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6]) / 7;
+    } else if(snr_how == 3){
+      mm[si] = v[0]; // weakest tone
+    } else if(snr_how == 4){
+      mm[si] = v[7]; // strongest tone
+    } else if(snr_how == 5){
+      mm[si] = v[6]; // second-strongest tone
+    } else {
+      mm[si] = 1.0;
+    }
+  }
+
+  // we're going to take a windowed average.
+  std::vector<double> winwin;
+  if(snr_win > 0){
+    winwin = blackman(2*snr_win+1);
+  } else {
+    winwin.push_back(1.0);
+  }
+
+  std::vector<std::vector<std::complex<double>>> n79(79);
+    
+  for(int si = 0; si < 79; si++){
+    double sum = 0;
+    for(int dd = si - snr_win; dd <= si + snr_win; dd++){
+      int wi = dd - (si - snr_win);
       if(dd >= 0 && dd < 79){
         sum += mm[dd] * winwin[wi];
       } else if(dd < 0){
@@ -1375,13 +1499,11 @@ convert_to_snr(const std::vector< std::vector<double> > &m79, int how, int win)
 // to drive LDPC decoder.
 // distribution of strongest tones, and
 // distribution of noise.
-// multiple ranges in case things change over time.
 //
 void
 make_stats(const std::vector<std::vector<double>> &m79,
-           Stats &noises,
            Stats &bests,
-           int x_best_in_noise)
+           Stats &all)
 {
   int costas[] = { 3, 1, 4, 0, 6, 5, 2 };
 
@@ -1394,26 +1516,20 @@ make_stats(const std::vector<std::vector<double>> &m79,
       else ci = si;
       for(int bi = 0; bi < 8; bi++){
         double x = m79[si][bi];
+        all.add(x);
         if(bi == costas[ci]){
           bests.add(x);
-          if(x_best_in_noise)
-            noises.add(x); // include best in noises too
-        } else {
-          noises.add(x);
         }
       }
     } else {
-      std::vector<double> v(8);
+      double mx = 0;
       for(int bi = 0; bi < 8; bi++){
-        v[bi] = m79[si][bi];
+        double x = m79[si][bi];
+        if(x > mx)
+          mx = x;
+        all.add(x);
       }
-      std::sort(v.begin(), v.end());
-      for(int i = 0; i < 7; i++){
-        noises.add(v[i]);
-      }
-      bests.add(v[7]);
-      if(x_best_in_noise)
-        noises.add(v[7]); // include best in noises too
+      bests.add(mx);
     }
   }
 }
@@ -1471,7 +1587,7 @@ soft_c2m(const ffts_t &c79)
     // phases. like median but avoids -pi..pi wrap-around.
     int n = v.size();
     int best = -1;
-    double best_score;
+    double best_score = 0;
     for(int i = 0; i < n; i++){
       double score = 0;
       for(int j = 0; j < n; j++){
@@ -1516,11 +1632,18 @@ soft_c2m(const ffts_t &c79)
 //
 double
 bayes(double best_zero, double best_one, int lli,
-      Stats &bests, Stats &noises)
+      Stats &bests, Stats &all)
 {
   double maxlog = 4.97;
   double ll = 0;
-
+      
+  double pzero = 0.5;
+  double pone = 0.5;
+  if(use_apriori){
+    pzero = 1.0 - apriori174[lli];
+    pone = apriori174[lli];
+  }
+  
   //
   // Bayes combining rule normalization from:
   // http://cs.wellesley.edu/~anderson/writing/naive-bayes.pdf
@@ -1532,23 +1655,20 @@ bayes(double best_zero, double best_one, int lli,
   // also see Mark Owen's book Practical Signal Processing,
   // Chapter 6.
   //
-      
-  double pzero = 0.5;
-  double pone = 0.5;
-  if(use_apriori){
-    pzero = 1.0 - apriori174[lli];
-    pone = apriori174[lli];
-  }
-      
+
   // zero
   double a = pzero *
     bests.problt(best_zero) *
-    (1.0 - noises.problt(best_one));
+    (1.0 - all.problt(best_one));
+  if(bayes_how == 1)
+    a *= all.problt(all.mean() + (best_zero - best_one));
   
   // one
   double b = pone *
     bests.problt(best_one) *
-    (1.0 - noises.problt(best_zero));
+    (1.0 - all.problt(best_zero));
+  if(bayes_how == 1)
+    b *= all.problt(all.mean() + (best_one - best_zero));
   
   double p;
   if(a + b == 0){
@@ -1556,7 +1676,7 @@ bayes(double best_zero, double best_one, int lli,
   } else {
     p = a / (a + b);
   }
-      
+
   if(1 - p == 0.0){
     ll = maxlog;
   } else {
@@ -1577,21 +1697,21 @@ bayes(double best_zero, double best_one, int lli,
 void
 soft_decode(const ffts_t &c79, double ll174[])
 {
+  std::vector< std::vector<double> > m79(79);
+
   // m79 = absolute values of c79.
   // still pre-un-gray-coding so we know which
   // are the correct Costas tones.
-  std::vector< std::vector<double> > m79(79);
   m79 = soft_c2m(c79);
 
-  m79 = convert_to_snr(m79, snr_how, snr_win);
+  m79 = convert_to_snr(m79);
     
   // statistics to decide soft probabilities.
   // distribution of strongest tones, and
   // distribution of noise.
-  // multiple ranges in case things change over time.
-  Stats noises(problt_how_noise);
   Stats bests(problt_how_sig);
-  make_stats(m79, noises, bests, best_in_noise);
+  Stats all(problt_how_noise);
+  make_stats(m79, bests, all);
 
   m79 = un_gray_code_r(m79);
 
@@ -1651,7 +1771,141 @@ soft_decode(const ffts_t &c79, double ll174[])
         }
       }
 
-      double ll = bayes(best_zero, best_one, lli, bests, noises);
+      double ll = bayes(best_zero, best_one, lli, bests, all);
+      
+      ll174[lli++] = ll;
+    }
+  }
+  assert(lli == 174);
+}
+
+//
+// c79 is 79x8 complex tones, before un-gray-coding.
+//
+void
+c_soft_decode(const ffts_t &c79x, double ll174[])
+{
+  ffts_t c79 = c_convert_to_snr(c79x);
+
+  int costas[] = { 3, 1, 4, 0, 6, 5, 2 };
+  std::complex<double> maxes[79];
+  for(int i = 0; i < 79; i++){
+    std::complex<double> m;
+    if(i < 7){
+      // Costas.
+      m = c79[i][costas[i]];
+    } else if(i >= 36 && i < 36 + 7){
+      // Costas.
+      m = c79[i][costas[i-36]];
+    } else if(i >= 72){
+      // Costas.
+      m = c79[i][costas[i-72]];
+    } else {
+      int got = 0;
+      for(int j = 0; j < 8; j++){
+        if(got == 0 || std::abs(c79[i][j]) > std::abs(m)){
+          got = 1;
+          m = c79[i][j];
+        }
+      }
+    }
+    maxes[i] = m;
+  }
+
+  std::vector<std::vector<double>> m79(79);
+  for(int i = 0; i < 79; i++){
+    m79[i].resize(8);
+    for(int j = 0; j < 8; j++){
+      std::complex<double> c = c79[i][j];
+      int n = 0;
+      double sum = 0;
+      for(int k = i - c_soft_win; k <= i + c_soft_win; k++){
+        if(k < 0 || k >= 79)
+          continue;
+        if(k == i){
+          sum -= c_soft_weight * std::abs(c);
+        } else {
+          // we're expecting all genuine tones to have
+          // about the same phase and magnitude.
+          // so set m79[i][j] to the distance from the
+          // phase/magnitude predicted by surrounding
+          // genuine-looking tones.
+          std::complex<double> c1 = maxes[k];
+          std::complex<double> d = c1 - c;
+          sum += std::abs(d);
+        }
+        n += 1;
+      }
+      m79[i][j] = 0 - (sum / n);
+    }
+  }
+    
+  // statistics to decide soft probabilities.
+  // distribution of strongest tones, and
+  // distribution of noise.
+  Stats bests(problt_how_sig);
+  Stats all(problt_how_noise);
+  make_stats(m79, bests, all);
+
+  m79 = un_gray_code_r(m79);
+
+  int lli = 0;
+  for(int i79 = 0; i79 < 79; i79++){
+    if(i79 < 7 || (i79 >= 36 && i79 < 36+7) || i79 >= 72){
+      // Costas, skip
+      continue;
+    }
+
+    // for each of the three bits, look at the strongest tone
+    // that would make it a zero, and the strongest tone that
+    // would make it a one. use Bayes to decide which is more
+    // likely, comparing each against the distribution of noise
+    // and the distribution of strongest tones.
+    // most-significant-bit first.
+
+    for(int biti = 0; biti < 3; biti++){
+      // tone numbers that make this bit zero or one.
+      int zeroi[4];
+      int onei[4];
+      if(biti == 0){
+        // high bit
+        zeroi[0] = 0; zeroi[1] = 1; zeroi[2] = 2; zeroi[3] = 3;
+        onei[0] = 4; onei[1] = 5; onei[2] = 6; onei[3] = 7;
+      }
+      if(biti == 1){
+        // middle bit
+        zeroi[0] = 0; zeroi[1] = 1; zeroi[2] = 4; zeroi[3] = 5;
+        onei[0] = 2; onei[1] = 3; onei[2] = 6; onei[3] = 7;
+      }
+      if(biti == 2){
+        // low bit
+        zeroi[0] = 0; zeroi[1] = 2; zeroi[2] = 4; zeroi[3] = 6;
+        onei[0] = 1; onei[1] = 3; onei[2] = 5; onei[3] = 7;
+      }
+
+      // strongest tone that would make this bit be zero.
+      int got_best_zero = 0;
+      double best_zero = 0;
+      for(int i = 0; i < 4; i++){
+        double x = m79[i79][zeroi[i]];
+        if(got_best_zero == 0 || x > best_zero){
+          got_best_zero = 1;
+          best_zero = x;
+        }
+      }
+
+      // strongest tone that would make this bit be one.
+      int got_best_one = 0;
+      double best_one = 0;
+      for(int i = 0; i < 4; i++){
+        double x = m79[i79][onei[i]];
+        if(got_best_one == 0 || x > best_one){
+          got_best_one = 1;
+          best_one = x;
+        }
+      }
+
+      double ll = bayes(best_zero, best_one, lli, bests, all);
       
       ll174[lli++] = ll;
     }
@@ -1689,148 +1943,26 @@ extract_bits(const std::vector<int> &syms, const std::vector<double> str)
   return bits;
 }
 
-// copied from wsjt-x ft2/gfsk_pulse.f90.
-// b is 1.0 for FT4; 2.0 for FT8. 
-double
-gfsk_point(double b, double t)
-{
-  double c = M_PI * sqrt(2.0 / log(2.0));
-  double x = 0.5 * (erf(c * b * (t + 0.5)) - erf(c * b * (t - 0.5)));
-  return x;
-}
-
-// the smoothing window for gfsk.
-// run the window over impulses of symbol frequencies,
-// each impulse at the center of its symbol time.
-// three symbols wide.
-// most of the pulse is in the center symbol.
-// b is 1.0 for FT4; 2.0 for FT8. 
-std::vector<double>
-gfsk_window(int samples_per_symbol, double b)
-{
-  std::vector<double> v(3 * samples_per_symbol);
-  double sum = 0;
-  for(int i = 0; i < v.size(); i++){
-    double x = i / (double)samples_per_symbol;
-    x -= 1.5;
-    double y = gfsk_point(b, x);
-    v[i] = y;
-    sum += y;
-  }
-  
-  for(int i = 0; i < v.size(); i++){
-    v[i] /= sum;
-  }
-
-  return v;
-}
-
-// gaussian-smoothed fsk.
-// the gaussian smooths the instantaneous frequencies,
-// so that the transitions between symbols don't
-// cause clicks.
-// gwin is gfsk_window(32, 2.0)
-std::vector<std::complex<double>>
-gfsk(const std::vector<int> &symbols,
-     double hz0, double hz1,
-     double spacing, int rate, int symsamples,
-     double phase0,
-     const std::vector<double> &gwin)
-{
-  assert((gwin.size() % 2) == 0);
-  
-  // compute frequency for each symbol.
-  // generate a spike in the middle of each symbol time;
-  // the gaussian filter will turn it into a waveform.
-  std::vector<double> hzv(symsamples * (symbols.size() + 2), 0.0);
-  for(int bi = 0; bi < symbols.size(); bi++){
-    double base_hz = hz0 + (hz1 - hz0) * (bi / (double) symbols.size());
-    double fr = base_hz + (symbols[bi] * spacing);
-    int mid = symsamples*(bi+1) + symsamples/2;
-    // the window has even size, so split the impulse over
-    // the two middle samples to be symmetric.
-    hzv[mid] = fr * symsamples / 2.0;
-    hzv[mid-1] = fr * symsamples / 2.0;
-  }
-
-  // repeat first and last symbols
-  for(int i = 0; i < symsamples; i++){
-    hzv[i] = hzv[i+symsamples];
-    hzv[symsamples*(symbols.size()+1) + i] = hzv[symsamples*symbols.size() + i];
-  }
-  
-  // run the per-sample frequency vector through
-  // the gaussian filter.
-  int half = gwin.size() / 2;
-  std::vector<double> o(hzv.size());
-  for(int i = 0; i < o.size(); i++){
-    double sum = 0;
-    for(int j = 0; j < gwin.size(); j++){
-      int k = i - half + j;
-      if(k >= 0 && k < hzv.size()){
-        sum += hzv[k] * gwin[j];
-      }
-    }
-    o[i] = sum;
-  }
-
-  // drop repeated first and last symbols
-  std::vector<double> oo(symsamples * symbols.size());
-  for(int i = 0; i < oo.size(); i++){
-    oo[i] = o[i + symsamples];
-  }
-
-  // now oo[i] contains the frequency for the i'th sample.
-
-  std::vector<std::complex<double>> v(symsamples * symbols.size());
-  double theta = phase0;
-  for(int i = 0; i < v.size(); i++){
-    v[i] = std::complex(cos(theta), sin(theta));
-    double hz = oo[i];
-    theta += 2 * M_PI / (rate / hz);
-  }
-
-  return v;
-}
-
-// generate 8-FSK, at 25 hz, bin size 6.25 hz,
-// 200 samples/second, 32 samples/symbol.
-// used as reference to detect pairs of symbols.
-// superseded by gfsk().
-std::vector<std::complex<double>>
-cfsk(const std::vector<int> &syms)
-{
-  int n = syms.size();
-  std::vector<std::complex<double>> v(n*32);
-  double theta = 0;
-  for(int si = 0; si < n; si++){
-    double hz = 25 + syms[si] * 6.25;
-    for(int i = 0; i < 32; i++){
-      v[si*32+i] = std::complex(cos(theta), sin(theta));
-      theta += 2 * M_PI / (200 / hz);
-    }
-  }
-  return v;
-}
-
 // decode successive pairs of symbols. exploits the likelyhood
 // that they have the same phase, by summing the complex
 // correlations for each possible pair and using the max.
 void
-soft_decode_pairs(const ffts_t &m79,
+soft_decode_pairs(const ffts_t &m79x,
                   double ll174[])
 {
+  ffts_t m79 = c_convert_to_snr(m79x);
+                       
   struct BitInfo {
     double zero; // strongest correlation that makes it zero
     double one;  // and one
   };
   std::vector<BitInfo> bitinfo(79*3);
-  for(int i = 0; i < bitinfo.size(); i++){
+  for(int i = 0; i < (int) bitinfo.size(); i++){
     bitinfo[i].zero = 0;
     bitinfo[i].one = 0;
   }
 
-  Stats noises(problt_how_noise);
+  Stats all(problt_how_noise);
   Stats bests(problt_how_sig);
 
   int map[] = { 0, 1, 3, 2, 6, 4, 5, 7 }; // un-gray-code
@@ -1850,7 +1982,7 @@ soft_decode_pairs(const ffts_t &m79,
         if(x > mx)
           mx = x;
 
-        noises.add(x);
+        all.add(x);
 
         // first symbol
         int i = map[s1];
@@ -1912,7 +2044,7 @@ soft_decode_pairs(const ffts_t &m79,
       double best_one = bitinfo[si*3+i].one;
       // ll174[lli++] = best_zero > best_one ? 4.99 : -4.99;
 
-      double ll = bayes(best_zero, best_one, lli, bests, noises);
+      double ll = bayes(best_zero, best_one, lli, bests, all);
       
       ll174[lli++] = ll;
     }
@@ -1921,20 +2053,22 @@ soft_decode_pairs(const ffts_t &m79,
 }
 
 void
-soft_decode_triples(const ffts_t &m79,
+soft_decode_triples(const ffts_t &m79x,
                     double ll174[])
 {
+  ffts_t m79 = c_convert_to_snr(m79x);
+  
   struct BitInfo {
     double zero; // strongest correlation that makes it zero
     double one;  // and one
   };
   std::vector<BitInfo> bitinfo(79*3);
-  for(int i = 0; i < bitinfo.size(); i++){
+  for(int i = 0; i < (int) bitinfo.size(); i++){
     bitinfo[i].zero = 0;
     bitinfo[i].one = 0;
   }
 
-  Stats noises(problt_how_noise);
+  Stats all(problt_how_noise);
   Stats bests(problt_how_sig);
 
   int map[] = { 0, 1, 3, 2, 6, 4, 5, 7 }; // un-gray-code
@@ -1956,7 +2090,7 @@ soft_decode_triples(const ffts_t &m79,
           if(x > mx)
             mx = x;
 
-          noises.add(x);
+          all.add(x);
 
           // first symbol
           int i = map[s1];
@@ -2037,7 +2171,7 @@ soft_decode_triples(const ffts_t &m79,
       double best_one = bitinfo[si*3+i].one;
       // ll174[lli++] = best_zero > best_one ? 4.99 : -4.99;
 
-      double ll = bayes(best_zero, best_one, lli, bests, noises);
+      double ll = bayes(best_zero, best_one, lli, bests, all);
       
       ll174[lli++] = ll;
     }
@@ -2047,6 +2181,7 @@ soft_decode_triples(const ffts_t &m79,
 
 //
 // given log likelyhood for each bit, try LDPC and OSD decoders.
+// on success, puts corrected 174 bits into a174[].
 //
 int
 decode(const double ll174[], int a174[], int use_osd, std::string &comment)
@@ -2106,9 +2241,9 @@ fbandpass(const std::vector<std::complex<double>> &bins0,
   // assert(low_outer >= 0);
   assert(low_outer <= low_inner);
   assert(low_inner <= high_inner);
-  assert(high_inner < high_outer);
+  assert(high_inner <= high_outer);
   // assert(high_outer <= bin_hz * bins0.size());
-  
+
   int nbins = bins0.size();
   std::vector<std::complex<double>> bins1(nbins);
 
@@ -2120,18 +2255,26 @@ fbandpass(const std::vector<std::complex<double>> &bins0,
       factor = 0;
     } else if(ihz >= low_outer && ihz < low_inner){
       // rising shoulder
+#if 1
+      factor = (ihz - low_outer) / (low_inner-low_outer); // 0 .. 1
+#else
       double theta = (ihz - low_outer) / (low_inner-low_outer); // 0 .. 1
       theta -= 1; // -1 .. 0
       theta *= 3.14159; // -pi .. 0
       factor = cos(theta); // -1 .. 1
       factor = (factor + 1) / 2; // 0 .. 1
+#endif
     } else if(ihz > high_inner && ihz <= high_outer){
       // falling shoulder
+#if 1
+      factor =  (high_outer - ihz) / (high_outer-high_inner); // 1 .. 0
+#else
       double theta =  (high_outer - ihz) / (high_outer-high_inner); // 1 .. 0
       theta = 1.0 - theta; // 0 .. 1
       theta *= 3.14159; // 0 .. pi
       factor = cos(theta); // 1 .. -1
       factor = (factor + 1) / 2; // 1 .. 0
+#endif
     } else {
       factor = 1.0;
     }
@@ -2194,7 +2337,7 @@ down_v7_f(const std::vector<std::complex<double>> &bins, int len, double hz)
   // convert back to time domain and down-sample to 200 samples/second.
   int blen = round(len * (200.0 / rate_));
   std::vector<std::complex<double>> bbins(blen / 2 + 1);
-  for(int i = 0; i < bbins.size(); i++)
+  for(int i = 0; i < (int) bbins.size(); i++)
     bbins[i] = bins1[i];
   std::vector<double> out = one_ifft(bbins, "down_v7b");
   
@@ -2240,8 +2383,8 @@ one_iter(const std::vector<double> &samples200, int best_off, double hz_for_cb)
   if(do_second){
     std::vector<Strength> strengths =
       search_both(samples200,
-                  25, second_hz_fracs, second_hz_win,
-                  best_off, second_off_fracs, second_off_win * 32);
+                  25, second_hz_n, second_hz_win,
+                  best_off, second_off_n, second_off_win * 32);
     //
     // sort strongest-first.
     //
@@ -2249,7 +2392,7 @@ one_iter(const std::vector<double> &samples200, int best_off, double hz_for_cb)
               [](const Strength &a, const Strength &b) -> bool
               { return a.strength_ > b.strength_; } );
     
-    for(int i = 0; i < strengths.size() && i < second_count; i++){
+    for(int i = 0; i < (int) strengths.size() && i < second_count; i++){
       double hz = strengths[i].hz_;
       int off = strengths[i].off_;
       int ret = one_iter1(samples200, off, hz, hz_for_cb, hz_for_cb);
@@ -2527,36 +2670,37 @@ one_iter1(const std::vector<double> &samples200x,
   }
 
   double ll174[174];
-  int ret;
 
-  soft_decode(m79, ll174);
-  ret = try_decode(samples200, ll174, best_hz, best_off,
-                   hz0_for_cb, hz1_for_cb, 1, "", m79);
-  if(ret){
-    //static int xx;
-    //if(xx++ == 3)
-    //  exit(1);
-    return ret;
+  if(soft_ones){
+    if(soft_ones == 1){
+      soft_decode(m79, ll174);
+    } else {
+      c_soft_decode(m79, ll174);
+    }
+    int ret = try_decode(samples200, ll174, best_hz, best_off,
+                         hz0_for_cb, hz1_for_cb, 1, "", m79);
+    if(ret)
+      return ret;
   }
 
   if(soft_pairs){
     double p174[174];
     soft_decode_pairs(m79, p174);
-    ret = try_decode(samples200, p174, best_hz, best_off,
-                     hz0_for_cb, hz1_for_cb, 1, "", m79);
-    if(ret){
+    int ret = try_decode(samples200, p174, best_hz, best_off,
+                         hz0_for_cb, hz1_for_cb, 1, "", m79);
+    if(ret)
       return ret;
-    }
+    if(soft_ones == 0)
+      memcpy(ll174, p174, sizeof(ll174));
   }
 
   if(soft_triples){
     double p174[174];
     soft_decode_triples(m79, p174);
-    ret = try_decode(samples200, p174, best_hz, best_off,
-                     hz0_for_cb, hz1_for_cb, 1, "", m79);
-    if(ret){
+    int ret = try_decode(samples200, p174, best_hz, best_off,
+                         hz0_for_cb, hz1_for_cb, 1, "", m79);
+    if(ret)
       return ret;
-    }
   }
 
   if(use_hints){
@@ -2643,9 +2787,9 @@ subtract(const std::vector<int> re79,
 
   ffts_t bins = ffts(moved, off0, block, "subtract");
 
-  if(bin0 + 8 > bins[0].size())
+  if(bin0 + 8 > (int) bins[0].size())
     return;
-  if(bins.size() < 79)
+  if((int) bins.size() < 79)
     return;
 
   std::vector<double> phases(79);
@@ -2786,7 +2930,17 @@ try_decode(const std::vector<double> &samples200,
   std::string comment(comment1);
 
   if(decode(ll174, a174, use_osd, comment)){
-    // a174 is 91 bits of plain message, 83 bits of parity.
+    // a174 is corrected 91 bits of plain message plus 83 bits of LDPC parity.
+
+    // how many of the corrected 174 bits match the received signal in ll174?
+    int correct_bits = 0;
+    for(int i = 0; i < 174; i++){
+      if(ll174[i] < 0 && a174[i] == 1){
+        correct_bits += 1;
+      } else if(ll174[i] > 0 && a174[i] == 0){
+        correct_bits += 1;
+      }
+    }
 
     // reconstruct correct 79 symbols from LDPC output.
     std::vector<int> re79 = recode(a174);
@@ -2817,7 +2971,7 @@ try_decode(const std::vector<double> &samples200,
     if(cb_ != 0){
       cb_mu_.lock();
       int ret = cb_(a174, best_hz + down_hz_, best_hz + down_hz_,
-                    best_off, comment.c_str(), snr, pass_);
+                    best_off, comment.c_str(), snr, pass_, correct_bits);
       cb_mu_.unlock();
       if(ret == 2){
         // a new decode. subtract it from nsamples_.
@@ -2917,6 +3071,9 @@ entry(double xsamples[], int nsamples, int start, int rate,
     if(i != nthreads-1 || overlap_edges)
       hz1 += overlap;
 
+    hz0 = std::max(hz0, 0.0);
+    hz1 = std::min(hz1, (rate / 2.0) - 50);
+
     FT8 *ft8 = new FT8(samples,
                        hz0, hz1,
                        start, rate,
@@ -2931,7 +3088,7 @@ entry(double xsamples[], int nsamples, int start, int rate,
     thv.push_back(ft8);
   }
 
-  for(int i = 0; i < thv.size(); i++){
+  for(int i = 0; i < (int) thv.size(); i++){
     thv[i]->th_->join();
     delete thv[i]->th_;
     delete thv[i];
@@ -2950,17 +3107,16 @@ set(char *param, char *val)
     {
      { "snr_win", &snr_win, 0 },
      { "snr_how", &snr_how, 0 },
-     { "best_in_noise", &best_in_noise, 0 },
      { "ldpc_iters", &ldpc_iters, 0 },
      { "shoulder200", &shoulder200, 1 },
      { "shoulder200_extra", &shoulder200_extra, 1 },
-     { "second_hz_fracs", &second_hz_fracs, 0 },
+     { "second_hz_n", &second_hz_n, 0 },
      { "second_hz_win", &second_hz_win, 1 },
-     { "second_off_fracs", &second_off_fracs, 0 },
+     { "second_off_n", &second_off_n, 0 },
      { "second_off_win", &second_off_win, 1 },
-     { "third_hz_inc", &third_hz_inc, 1 },
+     { "third_hz_n", &third_hz_n, 0 },
      { "third_hz_win", &third_hz_win, 1 },
-     { "third_off_inc", &third_off_inc, 1 },
+     { "third_off_n", &third_off_n, 0 },
      { "third_off_win", &third_off_win, 1 },
      { "log_tail", &log_tail, 1 },
      { "log_rate", &log_rate, 1 },
@@ -2974,8 +3130,8 @@ set(char *param, char *val)
      { "ncoarse_blocks", &ncoarse_blocks, 0 },
      { "tminus", &tminus, 1 },
      { "tplus", &tplus, 1 },
-     { "coarse_off_fracs", &coarse_off_fracs, 0 },
-     { "coarse_hz_fracs", &coarse_hz_fracs, 0 },
+     { "coarse_off_n", &coarse_off_n, 0 },
+     { "coarse_hz_n", &coarse_hz_n, 0 },
      { "already_hz", &already_hz, 1 },
      { "nthreads", &nthreads, 0 },
      { "npasses_one", &npasses_one, 0 },
@@ -2986,13 +3142,14 @@ set(char *param, char *val)
      { "osd_ldpc_thresh", &osd_ldpc_thresh, 0 },
      { "pass0_frac", &pass0_frac, 1 },
      { "go_extra", &go_extra, 1 },
-     { "reduce_len", &reduce_len, 0 },
      { "reduce_how", &reduce_how, 0 },
-     { "reduce_margin", &reduce_margin, 1 },
      { "do_reduce", &do_reduce, 0 },
      { "pass_threshold", &pass_threshold, 0 },
      { "strength_how", &strength_how, 0 },
+     { "known_strength_how", &known_strength_how, 0 },
      { "reduce_shoulder", &reduce_shoulder, 1 },
+     { "reduce_factor", &reduce_factor, 1 },
+     { "reduce_extra", &reduce_extra, 1 },
      { "overlap_edges", &overlap_edges, 0 },
      { "coarse_strength_how", &coarse_strength_how, 0 },
      { "coarse_all", &coarse_all, 1 },
@@ -3010,6 +3167,10 @@ set(char *param, char *val)
      { "fine_max_off", &fine_max_off, 0 },
      { "fine_max_tone", &fine_max_tone, 0 },
      { "known_sparse", &known_sparse, 0 },
+     { "soft_ones", &soft_ones, 0 },
+     { "c_soft_weight", &c_soft_weight, 1 },
+     { "c_soft_win", &c_soft_win, 0 },
+     { "bayes_how", &bayes_how, 0 },
     };
   int nparams = sizeof(params) / sizeof(params[0]);
 
@@ -3020,6 +3181,8 @@ set(char *param, char *val)
           *(int*)params[i].addr = round(atof(val));
         } else if(params[i].type == 1){
           *(double*)params[i].addr = atof(val);
+        } else {
+          assert(0);
         }
       }
       if(params[i].type == 0){

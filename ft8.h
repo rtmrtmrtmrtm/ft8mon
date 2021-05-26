@@ -4,7 +4,8 @@
 extern "C" {
   // let Python call just entry(), rather than a C++ mangled name.
   typedef int (*cb_t)(int *a91, double hz0, double hz1, double off,
-                      const char *, double snr, int pass);
+                      const char *, double snr, int pass,
+                      int correct_bits);
   // same as Python class CDECODE 
   //
   struct cdecode {
