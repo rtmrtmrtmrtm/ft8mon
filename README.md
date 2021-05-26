@@ -41,9 +41,11 @@ To read input from a recorded WAV file:
   ./ft8mon -file xxx.wav
 ```
 
-If you have an Airspy HF+ Discovery, and you install the airspyhf and
-liquid dsp libraries, you can uncomment the relevant lines in the
-Makefile.
+For Airspy HF+ Discovery support, install the airspyhf and
+liquid dsp libraries, and uncomment the relevant lines in the
+Makefile. For RFspace SDR-IP, NetSDR, CloudIQ, and CloudSDR
+support, install liquid dsp and edit the Makefile. Similarly
+for the Apache ANAN-7000dle.
 
 Robert Morris,
 AB1HL

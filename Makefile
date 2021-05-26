@@ -11,11 +11,13 @@ MOREH =
 # CXX += -DUSE_AIRSPYHF
 # LIBS += -lairspyhf -lliquid -lusb
 
+# for the Apache ANAN-7000dle, and possibly other HPSDR radios.
 # CXX += -DUSE_HPSDR
 # MOREC += hpsdr.cc
 # MOREH += hpsdr.h
 # LIBS += -lliquid
 
+# for the RFSpace SDR-IP, NetSDR, CloudIQ and CloudSDR in I/Q mode.
 # CXX += -DUSE_SDRIP
 # MOREC += sdrip.cc
 # MOREH += sdrip.h
