@@ -33,7 +33,7 @@ You should see output like this:
 094445 -15 -0.4 1227 AB1HL  NA7K   -10
 ```
 
-The columns are HHMMSS, SNR, time offset, frequency, and the message.
+The columns are HHMMSS, SNR, time offset, audio frequency, and the message.
 
 To read input from a recorded WAV file:
 

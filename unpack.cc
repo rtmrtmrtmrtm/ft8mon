@@ -14,7 +14,7 @@ un(int a77[], int start, int len)
 {
   __int128 x = 0;
 
-  assert(len < sizeof(x)*8 && start >= 0 && start + len <= 77);
+  assert(len < (int) sizeof(x)*8 && start >= 0 && start + len <= 77);
   for(int i = 0; i < len; i++){
     x <<= 1;
     x |= a77[start+i];
@@ -447,7 +447,7 @@ unpack_0_3(int a77[], int n3)
     sprintf(tmp, "%d%c ", n_transmitters + 1, clss + 'A');
     msg += tmp;
   }
-  if(section-1 >= 0 && section-1 < sizeof(sections)/sizeof(sections[0])){
+  if(section-1 >= 0 && section-1 < (int) (sizeof(sections)/sizeof(sections[0]))){
     msg += sections[section-1];
   }
 

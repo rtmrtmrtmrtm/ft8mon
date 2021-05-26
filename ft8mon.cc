@@ -9,17 +9,20 @@
 #include <unistd.h>
 #include <assert.h>
 #include <vector>
-#include <fftw3.h>
 #include <time.h>
 #include <string.h>
 #include <mutex>
 #include <map>
 #include <string>
+#include <thread>
 #include "snd.h"
 #include "util.h"
 #include "unpack.h"
 #include "ft8.h"
 #include "fft.h"
+#ifdef USE_HPSDR
+#include "hpsdr.h"
+#endif
 
 std::mutex cycle_mu;
 volatile int cycle_count;
@@ -31,7 +34,8 @@ std::map<std::string,bool> cycle_already;
 //
 int
 hcb(int *a91, double hz0, double hz1, double off,
-    const char *comment, double snr, int pass)
+    const char *comment, double snr, int pass,
+    int correct_bits)
 {
   std::string msg = unpack(a91);
 
@@ -51,13 +55,14 @@ hcb(int *a91, double hz0, double hz1, double off,
   struct tm result;
   gmtime_r(&saved_cycle_start, &result);
 
-  printf("%02d%02d%02d %3d %4.1f %4d %s\n",
+  printf("%02d%02d%02d %3d %3d %5.2f %6.1f %s\n",
          result.tm_hour,
          result.tm_min,
          result.tm_sec,
          (int)snr,
+         correct_bits,
          off - 0.5,
-         (int)hz0,
+         hz0,
          msg.c_str());
   fflush(stdout);
   
@@ -68,7 +73,7 @@ void
 usage()
 {
   fprintf(stderr, "Usage: ft8mon -card card channel\n");
-#ifdef AIRSPYHF
+#ifdef USE_AIRSPYHF
   fprintf(stderr, "       ft8mon -card airspy serial,mhz\n");
 #endif
   fprintf(stderr, "       ft8mon -levels card channel\n");
@@ -87,8 +92,8 @@ main(int argc, char *argv[])
   fftw_type = FFTW_ESTIMATE; // rather than FFTW_MEASURE
 
   extern int nthreads;
-  nthreads = 4; // multi-core?
-  
+  nthreads = 4; // multi-core
+
   if(argc == 4 && strcmp(argv[1], "-card") == 0){
     int wanted_rate = 12000;
     SoundIn *sin = SoundIn::open(argv[2], argv[3], wanted_rate);
@@ -110,13 +115,13 @@ main(int argc, char *argv[])
         std::vector<double> samples = sin->get(15 * rate, ttt_start, 1);
 
         // ttt_start is UNIX time of samples[0].
-        double ttt_end = ttt_start + samples.size() * (1.0 / rate);
+        double ttt_end = ttt_start + samples.size() / rate;
         cycle_start = ((long long) (ttt_end / 15)) * 15;
 
         // sample # of 0.5 seconds into the 15-second cycle.
         long long nominal_start = samples.size() - rate * (ttt_end - cycle_start - 0.5);
 
-        if(nominal_start >= 0 && nominal_start + 10*rate < samples.size()){
+        if(nominal_start >= 0 && nominal_start + 10*rate < (int) samples.size()){
           struct tm result;
           time_t tx = cycle_start;
           gmtime_r(&tx, &result);
@@ -163,7 +168,7 @@ main(int argc, char *argv[])
             0, (struct cdecode *) 0);
     }
     extern void fft_stats();
-    //fft_stats();
+    // fft_stats();
   } else if(argc == 2 && strcmp(argv[1], "-list") == 0){
     snd_list();
   } else {

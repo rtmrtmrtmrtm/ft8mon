@@ -1,5 +1,4 @@
 #include "fft.h"
-#include <fftw3.h>
 #include <mutex>
 #include <unistd.h>
 #include <assert.h>
@@ -8,7 +7,9 @@
 #include <sys/stat.h>
 #include "util.h"
 
-int fftw_type = FFTW_MEASURE;
+// MEASURE=0, ESTIMATE=64, PATIENT=32
+int fftw_type = FFTW_ESTIMATE;
+
 
 #define TIMING 0
 
@@ -18,6 +19,7 @@ int fftw_type = FFTW_MEASURE;
 class Plan {
 public:
   int n_;
+  int type_;
 
   //
   // real -> complex
@@ -62,6 +64,7 @@ get_plan(int n, const char *why)
     
   for(int i = 0; i < nplans; i++){
     if(plans[i]->n_ == n
+       && plans[i]->type_ == fftw_type
 #if TIMING
        && strcmp(plans[i]->why_, why) == 0
 #endif
@@ -114,6 +117,7 @@ get_plan(int n, const char *why)
   if(getpid() != plan_master_pid){
     type = FFTW_ESTIMATE;
   }
+  p->type_ = type;
   p->fwd_ = fftw_plan_dft_r2c_1d(n, p->r_, p->c_, type);
   assert(p->fwd_);
   p->rev_ = fftw_plan_dft_c2r_1d(n, p->c_, p->r_, type);
@@ -142,8 +146,8 @@ get_plan(int n, const char *why)
 
   if(0 && getpid() == plan_master_pid){
     double t1 = now();
-    fprintf(stderr, "miss pid=%d master=%d n=%d t=%.3f total=%d, %s\n",
-            getpid(), plan_master_pid, n, t1 - t0, nplans, why);
+    fprintf(stderr, "miss pid=%d master=%d n=%d t=%.3f total=%d type=%d, %s\n",
+            getpid(), plan_master_pid, n, t1 - t0, nplans, type, why);
   }
 
   plansmu.unlock();
@@ -178,7 +182,7 @@ one_fft(const std::vector<double> &samples, int i0, int block,
   double t0 = now();
 #endif
 
-  assert(samples.size() - i0 >= block);
+  assert((int) samples.size() - i0 >= block);
 
   int m_in_allocated = 0;
   double *m_in = (double*) samples.data() + i0;
