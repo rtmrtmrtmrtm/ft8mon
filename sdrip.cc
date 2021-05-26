@@ -109,8 +109,15 @@ SDRIP::open(std::string chan)
   if(is_sdrip()){
     iq_rate_ = 32000;
   } else if(is_cloudsdr()){
-    assert(rate_ <= 8000);
-    iq_rate_ = 8000;
+    if((122880000 % (rate_ * 4)) == 0){
+      // CloudSDR can directly generate rate_.
+      iq_rate_ = rate_;
+    } else if(rate_ <= 32000){
+      iq_rate_ = 32000;
+    } else {
+      // should use one of the radio's higher sample rates.
+      assert(0);
+    }
   } else {
     assert(0);
   }
