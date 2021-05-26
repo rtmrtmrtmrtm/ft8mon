@@ -1,7 +1,7 @@
-CXX = clang++ -O
+CXX = c++ -O
 # CXX += -g -fsanitize=address
 # CXX = g++9 -O3
-FLAGS = -std=c++17 -I/opt/local/include -I/usr/local/include -I/opt/local/include/libairspyhf
+FLAGS = -std=c++17 -I/opt/local/include -I/usr/local/include -I/opt/local/include/libairspyhf -I/usr/include/libairspyhf
 LIBS = -L/opt/local/lib -L/usr/local/lib -lfftw3 -lsndfile
 
 MOREC = 
