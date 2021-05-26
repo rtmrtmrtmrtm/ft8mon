@@ -8,8 +8,9 @@ MOREC =
 MOREH = 
 
 # uncomment if you have the airspyhf and liquid dsp libraries.
+# try -lusb or -lusb-1.0 ; also apt install libusb-1.0-0-dev
 # CXX += -DUSE_AIRSPYHF
-# LIBS += -lairspyhf -lliquid -lusb
+# LIBS += -lairspyhf -lliquid -lusb-1.0
 
 # for the Apache ANAN-7000dle, and possibly other HPSDR radios.
 # CXX += -DUSE_HPSDR

@@ -41,11 +41,17 @@ To read input from a recorded WAV file:
   ./ft8mon -file xxx.wav
 ```
 
-For Airspy HF+ Discovery support, install the airspyhf, libusb, 
+For Airspy HF+ Discovery support, install the airspyhf
 and liquid dsp libraries, and uncomment the relevant lines in the
 Makefile. For RFspace SDR-IP, NetSDR, CloudIQ, and CloudSDR
 support, install liquid dsp and edit the Makefile. Similarly
-for the Apache ANAN-7000dle.
+for the Apache ANAN-7000dle. Then try commands like these:
+
+```
+  ./ft8mon -card airspy ,14.074
+  ./ft8mon -card hpsdr 192.168.3.100,14.074
+  ./ft8mon -card sdrip 192.168.3.100,14.074
+```
 
 Robert Morris,
 AB1HL
