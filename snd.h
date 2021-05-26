@@ -3,16 +3,23 @@
 
 #include <math.h>
 #include <assert.h>
-#ifdef AIRSPYHF
+#if defined(USE_AIRSPYHF) || defined(USE_HPSDR) || defined(USE_SDRIP)
 #include <liquid/liquid.h>
 #endif
 #include <complex>
 #include <string>
 #include <vector>
 #include "util.h"
-#ifdef AIRSPYHF
+#ifdef USE_AIRSPYHF
 #include <airspyhf.h>
 #endif
+#ifdef USE_HPSDR
+#include "hpsdr.h"
+#endif
+#ifdef USE_SDRIP
+#include "sdrip.h"
+#endif
+#include "cloudsdr.h"
 
 void snd_init();
 void snd_list();
@@ -22,9 +29,13 @@ public:
   virtual void start() = 0;
   virtual int rate() = 0;
   virtual std::vector<double> get(int n, double &t0, int latest) = 0;
+  virtual bool has_iq() { return false; } // default
+  virtual std::vector<std::complex<double>> get_iq(int n, double &t0, int latest) {
+    assert(0);
+  }
   void levels();
   virtual int set_freq(int) { return -1; }
-  static SoundIn *open(std::string card, std::string chan, int wanted_rate);
+  static SoundIn *open(std::string card, std::string chan, int rate);
 };
 
 class CardSoundIn : public SoundIn {
@@ -43,7 +54,7 @@ class CardSoundIn : public SoundIn {
   double time_; // of most recent sample, buf_[wi_-1]
 
  public:
-  CardSoundIn(int card, int chan, int wanted_rate);
+  CardSoundIn(int card, int chan, int rate);
   void start();
   std::vector<double> get(int n, double &t0, int latest);
   int rate() { return rate_; }
@@ -63,11 +74,11 @@ private:
   int i_;
   double t_; // unix time of samples_[i_];
 public:
-  FileSoundIn(std::string filename, int wanted_rate) {
+  FileSoundIn(std::string filename, int rate) {
     samples_ = readwav(filename.c_str(), rate_);
-    if(wanted_rate != -1 && wanted_rate != rate_){
+    if(rate != -1 && rate != rate_){
       fprintf(stderr, "FileSoundIn(%s, %d) but rate %d\n",
-              filename.c_str(), wanted_rate, rate_);
+              filename.c_str(), rate, rate_);
       exit(1);
     }
     i_ = 0;
@@ -80,7 +91,7 @@ public:
 
     std::vector<double> v;
     for(int j = 0; j < n; j++){
-      if (i_ < samples_.size()){
+      if (i_ < (int) samples_.size()){
         v.push_back(samples_[i_]);
         i_ += 1;
         t_ += 1 / (double) rate_;
@@ -97,7 +108,7 @@ public:
   }
 };
 
-#ifdef AIRSPYHF
+#ifdef USE_AIRSPYHF
 class AirspySoundIn : public SoundIn {
  private:
   struct airspyhf_device* device_;
@@ -120,7 +131,7 @@ class AirspySoundIn : public SoundIn {
   unsigned long long get_serial();
 
  public:
-  AirspySoundIn(std::string chan, int wanted_rate);
+  AirspySoundIn(std::string chan, int rate);
   ~AirspySoundIn() { firfilt_crcf_destroy(filter_); }
   void start();
   std::vector<double> get(int n, double &t0, int latest);
@@ -132,18 +143,109 @@ class AirspySoundIn : public SoundIn {
 };
 #endif
 
+#ifdef USE_HPSDR
+class HPSDRSoundIn : public SoundIn {
+private:
+  HPSDR *sdr_;
+  int unit_;
+  int rate_;
+  int hz_;
+
+  // buffered input.
+  std::vector<std::complex<double>> buf_;
+  double time_; // of most recent sample, buf_[wi_-1]
+
+  void absorb();
+
+public:
+  std::vector<double> usb(std::vector<std::complex<double>> &v1);
+
+public:
+  HPSDRSoundIn(std::string chan, int rate);
+  ~HPSDRSoundIn();
+  void start();
+  std::vector<double> get(int n, double &t0, int latest);
+  bool has_iq() { return true; }
+  std::vector<std::complex<double>> get_iq(int n, double &t0, int latest);
+  int rate() { return rate_; }
+  int set_freq(int);
+  HPSDR *sdr() { return sdr_; }
+};
+#endif
+
+class CloudSoundIn : public SoundIn {
+ private:
+  std::string chan_;
+  CloudSDR *sdr_;
+
+ public:
+  CloudSoundIn(std::string chan, int rate);
+  void start();
+  std::vector<double> get(int n, double &t0, int latest);
+  int rate() { return 8000; }
+  int set_freq(int);
+};
+
+#ifdef USE_SDRIP
+class SDRIPSoundIn : public SoundIn {
+ private:
+  std::string chan_;
+  SDRIP *sdr_;
+  int rate_; // desired rate
+  std::vector<std::complex<double>> buf_;
+  double time_; // of most recent sample, buf_[wi_-1]
+
+  std::vector<double> usb(std::vector<std::complex<double>> &v1);
+  void absorb();
+
+ public:
+  SDRIPSoundIn(std::string chan, int rate);
+  void start();
+  std::vector<double> get(int n, double &t0, int latest);
+  bool has_iq() { return true; }
+  int rate() { return rate_; }
+  int set_freq(int);
+  std::vector<std::complex<double>> get_iq(int n, double &t0, int latest);
+};
+#endif
+
 class SoundOut {
+public:
+  virtual void start() = 0;
+  virtual int rate() = 0;
+  virtual void write(const std::vector<double> &v) = 0;
+  virtual void set_freq(int hz) { }
+  static SoundOut *open(const std::string card, const std::string chan, int rate);
+};
+
+class CardSoundOut : public SoundOut{
  private:
   int card_;
   int rate_;
   void *str_; // PaStream
 
  public:
-  SoundOut(int card);
+  CardSoundOut(int card, int rate);
   void start();
   int rate() { return rate_; }
   void write(const std::vector<short int> &);
   void write(const std::vector<double> &);
 };
+
+#ifdef USE_HPSDR
+class HPSDRSoundOut : public SoundOut {
+private:
+  int rate_;
+  HPSDR *sdr_;
+  int hz_; // carrier e.g. 14070000
+  
+public:
+  HPSDRSoundOut(const std::string chan, int rate);
+  void start();
+  int rate() { return rate_; }
+  void write(const std::vector<double> &);
+  void set_freq(int hz) { hz_ = hz; }
+};
+#endif
 
 #endif

@@ -30,7 +30,7 @@ snd_init()
 extern "C" void
 airspy_list()
 {
-#ifdef AIRSPYHF
+#ifdef USE_AIRSPYHF
   int ndev = airspyhf_list_devices(0, 0);
   if(ndev > 0){
     uint64_t serials[20];
@@ -52,6 +52,15 @@ airspy_list()
   }
 #endif
 }
+
+extern "C" void
+hpsdr_list()
+{
+#ifdef USE_HPSDR
+  HPSDR::list();
+#endif
+}
+
 
 //
 // print a list of sound devices
@@ -93,6 +102,7 @@ snd_list()
   }
 
   airspy_list();
+  hpsdr_list();
 }
 
 //
@@ -111,7 +121,7 @@ SoundIn::levels()
     std::vector<double> buf = get(rate(), dummy, 0);
     if(buf.size() == 0)
       usleep(100*1000);
-    for(int i = 0; i < buf.size(); i++){
+    for(int i = 0; i < (int) buf.size(); i++){
       sum += fabs(buf[i]);
       n += 1;
       if(fabs(buf[i]) > max){
@@ -130,21 +140,31 @@ SoundIn::levels()
 
 //
 // generic open.
-// wanted_rate can be -1.
+// rate can be -1.
 //
 SoundIn *
-SoundIn::open(std::string card, std::string chan, int wanted_rate)
+SoundIn::open(std::string card, std::string chan, int rate)
 {
   assert(card.size() > 0);
   SoundIn *sin;
 
   if(isdigit(card[0])){
-    sin = new CardSoundIn(atoi(card.c_str()), atoi(chan.c_str()), wanted_rate);
+    sin = new CardSoundIn(atoi(card.c_str()), atoi(chan.c_str()), rate);
   } else if(card == "file"){
-    sin = new FileSoundIn(chan, wanted_rate);
-#ifdef AIRSPYHF
+    sin = new FileSoundIn(chan, rate);
+#ifdef USE_AIRSPYHF
   } else if(card == "airspy"){
-    sin = new AirspySoundIn(chan, wanted_rate);
+    sin = new AirspySoundIn(chan, rate);
+#endif
+#ifdef USE_HPSDR
+  } else if(card == "hpsdr"){
+    sin = new HPSDRSoundIn(chan, rate);
+#endif
+  } else if(card == "cloudsdr"){
+    sin = new CloudSoundIn(chan, rate);
+#ifdef USE_SDRIP
+  } else if(card == "sdrip"){
+    sin = new SDRIPSoundIn(chan, rate);
 #endif
   } else {
     fprintf(stderr, "SoundIn::open(%s, %s): type not recognized\n", card.c_str(), chan.c_str());
@@ -171,7 +191,7 @@ CardSoundIn::cb(const void *input,
             (int)statusFlags, (int)frameCount);
   }
 
-  for(int i = 0; i < frameCount; i++){
+  for(int i = 0; i < (int) frameCount; i++){
     if(((sin->wi_ + 1) % sin->n_) != sin->ri_){
       sin->buf_[sin->wi_] = buf[i*sin->channels_ + sin->chan_];
       sin->wi_ = (sin->wi_ + 1) % sin->n_;
@@ -186,13 +206,13 @@ CardSoundIn::cb(const void *input,
   return 0;
 }
 
-CardSoundIn::CardSoundIn(int card, int chan, int wanted_rate)
+CardSoundIn::CardSoundIn(int card, int chan, int rate)
 {
   card_ = card;
   chan_ = chan;
   assert(chan_ >= 0 && chan_ <= 1);
   time_ = -1;
-  rate_ = wanted_rate;
+  rate_ = rate;
 }
 
 //
@@ -230,7 +250,7 @@ CardSoundIn::get(int n, double &t0, int latest)
     t0 -= ((wi_ + n_) - ri_) * (1.0 / rate_);
   }
 
-  while(v.size() < n){
+  while((int) v.size() < n){
     if(ri_ == wi_){
       break;
     }
@@ -313,14 +333,49 @@ CardSoundIn::start()
 
 }
 
-#ifdef AIRSPYHF
+//
+// convert I/Q to USB via the phasing method.
+// uses FFTs over the whole of a[], so it's slow.
+// and the results are crummy at the start and end.
+//
+std::vector<double>
+iq2usb(const std::vector<std::complex<double>> &a)
+{
+#if 0
+  int slop = 10000;
+  std::vector<std::complex<double>> a(aa.size() + 2*slop);
+  for(int i = 0; i < (int)a.size(); i++){
+    if(i - slop >= 0 && i - slop < (int) aa.size()){
+      a[i] = aa[i-slop];
+    } else {
+      a[i] = aa[i % slop];
+    }
+  }
+#endif
+  
+  std::vector<double> ii = vreal(analytic(vreal(a), "snd::iq2usb_i"));
+  std::vector<double> qq = vimag(analytic(vimag(a), "snd::iq2usb_q"));
+  std::vector<double> ssb(ii.size());
+  for(int i = 0; i < (int) ii.size(); i++){
+    ssb[i] = ii[i] - qq[i];
+  }
+
+#if 0
+  ssb.erase(ssb.begin(), ssb.begin()+slop);
+  ssb.resize(aa.size());
+#endif
+  
+  return ssb;
+}
+
+#ifdef USE_AIRSPYHF
 //
 // chan argument is serial[,megahertz].
 // e.g. 3B52EB5DAC35398D,14.074
 // or -,megahertz
 // or just serial #
 //
-AirspySoundIn::AirspySoundIn(std::string chan, int wanted_rate)
+AirspySoundIn::AirspySoundIn(std::string chan, int rate)
 {
   device_ = 0;
   //hz_ = 1000000.0 * atof(chan.c_str());
@@ -332,10 +387,10 @@ AirspySoundIn::AirspySoundIn(std::string chan, int wanted_rate)
   gethostname(hostname_, sizeof(hostname_));
   hostname_[sizeof(hostname_)-1] = '\0';
 
-  if(wanted_rate == -1){
+  if(rate == -1){
     rate_ = 12000;
   } else {
-    rate_ = wanted_rate;
+    rate_ = rate;
   }
 
   int comma = chan.find(",");
@@ -352,7 +407,7 @@ AirspySoundIn::AirspySoundIn(std::string chan, int wanted_rate)
     // open by Airspy HF+ serial number.
     uint64_t serial = strtoull(chan.c_str(), 0, 16);
     if(airspyhf_open_sn(&device_, serial) != AIRSPYHF_SUCCESS ) {
-      fprintf(stderr, "airspyhf_open_sn(%llx) failed\n", serial);
+      fprintf(stderr, "airspyhf_open_sn(%llx) failed\n", (unsigned long long) serial);
       exit(1);
     }
   }
@@ -386,20 +441,11 @@ AirspySoundIn::AirspySoundIn(std::string chan, int wanted_rate)
   ri_ = 0;
 
   // Liquid DSP filter + resampler to convert 192000 to 6000.
-  // firdecim?
-  // iirdecim?
-  // msresamp?
-  // msresamp2?
-  // resamp?
-  // resamp2?
   int h_len = estimate_req_filter_len(0.01, 60.0);
   float h[h_len];
   double cutoff = (rate_ / (double) air_rate_) / 2.0;
-  liquid_firdes_kaiser(h_len,
-                       cutoff,
-                       60.0,
-                       0.0,
-                       h);
+  liquid_firdes_kaiser(h_len, cutoff, 60.0, 0.0, h);
+
   assert((air_rate_ % rate_) == 0);
   filter_ = firfilt_crcf_create(h, h_len);
 }
@@ -474,7 +520,15 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
   time_ = now();
 
   airspyhf_complex_float_t *buf = transfer->samples;
-  for(int i = 0; i < transfer->sample_count + transfer->dropped_samples; i++){
+
+  FILE *fp = 0;
+  
+  if(0){
+    fp = fopen("airspy.dat", "a");
+    assert(fp);
+  }
+
+  for(int i = 0; i < (int)(transfer->sample_count + transfer->dropped_samples); i++){
     // low-pass filter, preparatory to rate reduction.
     liquid_float_complex x, y;
     if(i < transfer->sample_count){
@@ -483,6 +537,15 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
     } else {
       x.real = x.imag = 0;
     }
+
+    if(fp){
+      double dd;
+      dd = x.real;
+      fwrite(&dd, sizeof(dd), 1, fp);
+      dd = x.imag;
+      fwrite(&dd, sizeof(dd), 1, fp);
+    }
+    
     firfilt_crcf_push(filter_, x);
     firfilt_crcf_execute(filter_, &y);
 
@@ -503,44 +566,10 @@ AirspySoundIn::cb2(airspyhf_transfer_t *transfer)
     count_ += 1;
   }
 
+  if(fp)
+    fclose(fp);
+
   return 0;
-}
-
-std::vector<double>
-vreal(std::vector<std::complex<double>> a)
-{
-  std::vector<double> b(a.size());
-  for(int i = 0; i < a.size(); i++){
-    b[i] = a[i].real();
-  }
-  return b;
-}
-
-std::vector<double>
-vimag(std::vector<std::complex<double>> a)
-{
-  std::vector<double> b(a.size());
-  for(int i = 0; i < a.size(); i++){
-    b[i] = a[i].imag();
-  }
-  return b;
-}
-
-//
-// convert I/Q to USB via the phasing method.
-// uses FFTs over the whole of a[], so it's slow.
-// and the results are crummy at the start and end.
-//
-std::vector<double>
-iq2usb(std::vector<std::complex<double>> a)
-{
-  std::vector<double> ii = vreal(analytic(vreal(a), "snd::iq2usb_i"));
-  std::vector<double> qq = vimag(analytic(vimag(a), "snd::iq2usb_q"));
-  std::vector<double> ssb(ii.size());
-  for(int i = 0; i < ii.size(); i++){
-    ssb[i] = ii[i] - qq[i];
-  }
-  return ssb;
 }
 
 // UNIX time of first sample in t0.
@@ -571,7 +600,7 @@ AirspySoundIn::get(int n, double &t0, int latest)
   }
 
   std::vector<std::complex<double>> v1;
-  while(v1.size() < n){
+  while((int) v1.size() < n){
     if(ri_ == wi_){
       break;
     }
@@ -598,7 +627,7 @@ AirspySoundIn::get(int n, double &t0, int latest)
       v1.resize(v1.size() + needed, 0.0);
     }
     std::vector<double> v2 = iq2usb(v1);
-    if(v2.size() > olen){
+    if((int) v2.size() > olen){
       v2.resize(olen);
     }
     return v2;
@@ -606,22 +635,433 @@ AirspySoundIn::get(int n, double &t0, int latest)
 }
 #endif
 
-SoundOut::SoundOut(int card)
+#if 0
+void
+eval_filter(float h[], int h_len, int rate)
 {
-  card_ = card;
+  for(double hz = 4000; hz < rate / 2 && hz < 8000; hz += 20){
+    firfilt_crcf ff = firfilt_crcf_create(h, h_len);
+    double phase = 0;
+    double sum = 0;
+    int nn = 100 * h_len;
+    for(int i = 0; i < nn; i++){
+      liquid_float_complex x, y;
+      x.real = cos(phase);
+      x.imag = sin(phase);
+      phase += hz * 2 * M_PI / rate;
+      firfilt_crcf_push(ff, x);
+      firfilt_crcf_execute(ff, &y);
+      sum += sqrt(y.real*y.real + y.imag*y.imag);
+    }
+    sum /= nn;
+    printf("%.1f %f\n", hz, sum);
+    fflush(stdout);
+    firfilt_crcf_destroy(ff);
+  }
+}
+#endif
+
+#ifdef USE_HPSDR
+HPSDRSoundIn::HPSDRSoundIn(std::string chan, int rate)
+{
+  assert(rate > 0);
+  rate_ = rate;
+
+  int comma = chan.find(",");
+  if(comma >= 0){
+    hz_ = atof(chan.c_str() + comma + 1) * 1000000.0;
+  } else {
+    fprintf(stderr, "HPSDR needs chan IPAddress,MHz or just ,MHz\n");
+    exit(1);
+  }
+
+  if(comma == 0 || chan.size() < 1 || chan[0] == '-'){
+    // open any HPSDR found on the ethernet.
+    sdr_ = HPSDR::open();
+    unit_ = sdr_->allocate_unit(rate_);
+  } else {
+    // open an HPSDR at a specified IP address.
+    assert(0);
+  }
+
+  sdr_->set_freq(unit_, hz_);
+  
+  time_ = -1;
 }
 
 void
-SoundOut::start()
+HPSDRSoundIn::start()
+{
+}
+
+int
+HPSDRSoundIn::set_freq(int hz)
+{
+  hz_ = hz;
+  sdr_->set_freq(unit_, hz);
+  return hz;
+}
+
+//
+// read waiting HPSDR input, filter, down-sample, buffer.
+//
+void
+HPSDRSoundIn::absorb()
+{
+  std::vector<std::complex<double>> v;
+
+  sdr_->get(unit_, v);
+  if(v.size() == 0)
+    return;
+
+  if(0){
+    FILE *fp = fopen("hpsdr.dat", "a");
+    assert(fp);
+    for(int i = 0; i < (int) v.size(); i++){
+      double x = v[i].real();
+      fwrite(&x, sizeof(x), 1, fp);
+      x = v[i].imag();
+      fwrite(&x, sizeof(x), 1, fp);
+    }
+    fclose(fp);
+  }
+
+  time_ = now();
+
+  buf_.insert(buf_.begin(), v.begin(), v.end());
+
+  if((int) buf_.size() > 100 * rate_){
+    fprintf(stderr, "HPSDRSoundIn: buf_ too big\n");
+    buf_.clear();
+  }
+}
+
+//
+// convert from I/Q to upper sideband.
+// sample rate has already been reduced (e.g. from 48000 to 12000).
+// modifies v1[].
+//
+std::vector<double>
+HPSDRSoundIn::usb(std::vector<std::complex<double>> &v1)
+{
+  if(v1.size() < 2){
+    // analytic() demands more than one sample.
+    return vreal(v1);
+  } else {
+    // pad to increase chances that we can re-use an FFT plan.
+    int olen = v1.size();
+    int quantum;
+    if(olen > rate() * 5){
+      quantum = rate();
+    } else if(olen > 1000){
+      quantum = 1000;
+    } else {
+      quantum = 100;
+    }
+    int needed = quantum - (olen % quantum);
+    if(needed != quantum){
+      v1.resize(v1.size() + needed, 0.0);
+    }
+    std::vector<double> v2 = iq2usb(v1);
+    if((int) v2.size() > olen){
+      v2.resize(olen);
+    }
+    return v2;
+  }
+}
+
+//
+// return I/Q samples.
+//
+std::vector<std::complex<double>>
+HPSDRSoundIn::get_iq(int n, double &t0, int latest)
+{
+  // read and rate-reduce HPSDR input, place in buf_.
+  absorb();
+
+  if(time_ < 0 && buf_.size() == 0){
+    // no input has ever arrived.
+    t0 = -1;
+    return std::vector<std::complex<double>>();
+  }
+
+  if(latest && (int) buf_.size() > n){
+    buf_.erase(buf_.begin(), buf_.begin() + (buf_.size() - n));
+  }
+
+  // time of first sample in buf_.
+  t0 = time_ - buf_.size() / (double) rate_;
+
+  int nn = std::min(n, (int) buf_.size());
+  std::vector<std::complex<double>> v1(buf_.begin(), buf_.begin() + nn);
+  buf_.erase(buf_.begin(), buf_.begin() + nn);
+
+  return v1;
+}
+
+//
+// read a bunch of recent sound samples.
+// read up to n samples, no more.
+// return immediately with whatever samples exist,
+// perhaps fewer than n.
+// return UNIX time of first sample in t0.
+// if latest==1, return (up to) the most recent n samples
+// and discard any earlier samples.
+// converts from I/Q to upper sideband.
+//
+std::vector<double>
+HPSDRSoundIn::get(int n, double &t0, int latest)
+{
+  std::vector<std::complex<double>> v1 = get_iq(n, t0, latest);
+  if(v1.size() == 0){
+    std::vector<double> nothing;
+    return nothing;
+  }
+  std::vector<double> rrr = usb(v1);
+  return rrr;
+}
+#endif
+
+// chan should be e.g. 192.168.3.140
+CloudSoundIn::CloudSoundIn(std::string chan, int rate)
+{
+  printf("%d\n", rate);
+  assert(rate == 8000);
+  chan_ = chan;
+  sdr_ = new CloudSDR();
+}
+
+void
+CloudSoundIn::start()
+{
+  sdr_->open(chan_);
+}
+
+//
+// read a bunch of recent sound samples.
+// read up to n samples, no more.
+// return immediately with whatever samples exist,
+// perhaps fewer than n.
+// return UNIX time of first sample in t0.
+// if latest==1, return (up to) the most recent n samples
+// and discard any earlier samples.
+//
+std::vector<double>
+CloudSoundIn::get(int n, double &t0, int latest)
+{
+  double lastt;
+  std::vector<short> v0 = sdr_->get(lastt);
+
+  int skip = 0;
+  if(latest && n > 0){
+    if((int) v0.size() > n){
+      skip = v0.size() - n;
+    }
+  } else if(latest){
+    assert(0);
+  } else if(n > 0){
+    assert(0);
+  }
+
+  std::vector<double> v1(v0.size() - skip);
+  for(int i = 0; i < (int) v1.size(); i++){
+    v1[i] = v0[i+skip];
+  }
+  
+  t0 = lastt - (v1.size() / (double) rate());
+  return v1;
+}
+
+int
+CloudSoundIn::set_freq(int hz)
+{
+  sdr_->set_frequency(hz);
+  return hz;
+}
+
+#if USE_SDRIP
+// chan should be e.g. 192.168.3.140
+SDRIPSoundIn::SDRIPSoundIn(std::string chan, int rate)
+{
+  rate_ = rate;
+  chan_ = chan;
+  sdr_ = new SDRIP(rate);
+}
+
+void
+SDRIPSoundIn::start()
+{
+  sdr_->open(chan_);
+}
+
+//
+// read waiting SDRIP input, filter, down-sample, buffer.
+//
+void
+SDRIPSoundIn::absorb()
+{
+  std::vector<std::complex<double>> v;
+
+  sdr_->get(v);
+  if(v.size() == 0)
+    return;
+
+  time_ = now();
+
+  buf_.insert(buf_.begin(), v.begin(), v.end());
+
+  if((int) buf_.size() > 100 * rate_){
+    fprintf(stderr, "SDRIPSoundIn: buf_ too big\n");
+    buf_.clear();
+  }
+}
+
+//
+// convert from I/Q to upper sideband.
+// (sdrip.cc has already reduced the rate (if needed).)
+// modifies v1[].
+//
+std::vector<double>
+SDRIPSoundIn::usb(std::vector<std::complex<double>> &v1)
+{
+  if(v1.size() < 2){
+    // analytic() demands more than one sample.
+    return vreal(v1);
+  } else {
+    // pad to increase chances that we can re-use an FFT plan.
+    int olen = v1.size();
+    int quantum;
+    if(olen > rate() * 5){
+      quantum = rate();
+    } else if(olen > 1000){
+      quantum = 1000;
+    } else {
+      quantum = 100;
+    }
+    int needed = quantum - (olen % quantum);
+    if(needed != quantum){
+      v1.resize(v1.size() + needed, 0.0);
+    }
+    std::vector<double> v2 = iq2usb(v1);
+    if((int) v2.size() > olen){
+      v2.resize(olen);
+    }
+    return v2;
+  }
+}
+
+//
+// return I/Q samples.
+//
+std::vector<std::complex<double>>
+SDRIPSoundIn::get_iq(int n, double &t0, int latest)
+{
+  // read waiting SDRIP input, place in buf_.
+  absorb();
+
+  if(time_ < 0 && buf_.size() == 0){
+    // no input has ever arrived.
+    t0 = -1;
+    return std::vector<std::complex<double>>();
+  }
+
+  if(latest && (int) buf_.size() > n){
+    buf_.erase(buf_.begin(), buf_.begin() + (buf_.size() - n));
+  }
+
+  // time of first sample in buf_.
+  t0 = time_ - buf_.size() / (double) rate_;
+
+  int nn = std::min(n, (int) buf_.size());
+  std::vector<std::complex<double>> v1(buf_.begin(), buf_.begin() + nn);
+  buf_.erase(buf_.begin(), buf_.begin() + nn);
+
+  return v1;
+}
+
+//
+// read a bunch of recent sound samples.
+// read up to n samples, no more.
+// return immediately with whatever samples exist,
+// perhaps fewer than n.
+// return UNIX time of first sample in t0.
+// if latest==1, return (up to) the most recent n samples
+// and discard any earlier samples.
+//
+std::vector<double>
+SDRIPSoundIn::get(int n, double &t0, int latest)
+{
+  std::vector<std::complex<double>> v1 = get_iq(n, t0, latest);
+  if(v1.size() == 0){
+    std::vector<double> nothing;
+    return nothing;
+  }
+  std::vector<double> rrr = usb(v1);
+  return rrr;
+}
+
+int
+SDRIPSoundIn::set_freq(int hz)
+{
+  sdr_->set_frequency(hz);
+  return hz;
+}
+#endif
+
+SoundOut *
+SoundOut::open(const std::string card, const std::string chan, int rate)
+{
+  assert(card.size() > 0);
+  SoundOut *sout;
+
+  if(isdigit(card[0])){
+    assert(chan == "0");
+    sout = new CardSoundOut(atoi(card.c_str()), rate);
+#ifdef USE_HPSDR
+  } else if(card == "hpsdr"){
+    sout = new HPSDRSoundOut(chan, rate);
+#endif
+  } else {
+    fprintf(stderr, "SoundOut::open(%s): type not recognized\n",
+            card.c_str());
+    exit(1);
+  }
+
+  return sout;
+}
+
+#ifdef USE_HPSDR
+HPSDRSoundOut::HPSDRSoundOut(const std::string chan, int rate)
+{
+  rate_ = rate;
+  hz_ = 0;
+
+  // open any HPSDR found on the ethernet.
+  sdr_ = HPSDR::open();
+}
+
+void
+HPSDRSoundOut::start()
+{
+}
+
+void
+HPSDRSoundOut::write(const std::vector<double> &v)
+{
+  sdr_->tx_real(hz_, v, rate_);
+}
+#endif
+
+CardSoundOut::CardSoundOut(int card, int rate)
+{
+  card_ = card;
+  rate_ = rate;
+}
+
+void
+CardSoundOut::start()
 {
   snd_init();
-
-#ifdef __linux__
-  // RIGblaster only supports 44100 and 48000.
-  rate_ = 48000;
-#else
-  rate_ = 8000;
-#endif
 
   PaStreamParameters op;
   memset(&op, 0, sizeof(op));
@@ -660,7 +1100,7 @@ SoundOut::start()
 // the amount seems to be controlled by suggestedLatency.
 //
 void
-SoundOut::write(const std::vector<short int> &v)
+CardSoundOut::write(const std::vector<short int> &v)
 {
   PaError err = Pa_WriteStream(str_, v.data(), v.size());
   if(err != paNoError && err != paOutputUnderflowed){
@@ -670,12 +1110,12 @@ SoundOut::write(const std::vector<short int> &v)
 }
 
 void
-SoundOut::write(const std::vector<double> &v)
+CardSoundOut::write(const std::vector<double> &v)
 {
   std::vector<short int> vv(v.size());
-  for(int i = 0; i < v.size(); i++){
+  for(int i = 0; i < (int) v.size(); i++){
     if(v[i] > 1.0){
-      fprintf(stderr, "SoundOut::write() oops %f\n", v[i]);
+      fprintf(stderr, "CardSoundOut::write() oops %f\n", v[i]);
     }
     vv[i] = v[i] * 16380;
   }
@@ -687,15 +1127,18 @@ SoundOut::write(const std::vector<double> &v)
 //
 
 extern "C" {
-  void *ext_snd_open(const char *card, const char *chan, int wanted_rate);
-  int ext_snd_read(void *, double *, int, double *);
-  int ext_set_freq(void *, int);
+  void *ext_snd_in_open(const char *card, const char *chan, int rate);
+  int ext_snd_in_read(void *, double *, int, double *);
+  int ext_snd_in_freq(void *, int);
+  void *ext_snd_out_open(const char *card, const char *chan, int rate);
+  int ext_snd_out_freq(void *, int);
+  void ext_snd_out_write(void *, double *, int);
 }
 
 void *
-ext_snd_open(const char *card, const char *chan, int wanted_rate)
+ext_snd_in_open(const char *card, const char *chan, int rate)
 {
-  SoundIn *sin = SoundIn::open(card, chan, wanted_rate);
+  SoundIn *sin = SoundIn::open(card, chan, rate);
   sin->start();
   return (void *) sin;
 }
@@ -707,27 +1150,71 @@ ext_snd_open(const char *card, const char *chan, int wanted_rate)
 // return value is number of samples written to out[].
 //
 int
-ext_snd_read(void *thing, double *out, int maxout, double *tm)
+ext_snd_in_read(void *thing, double *out, int maxout, double *tm)
 {
   SoundIn *sin = (SoundIn *) thing;
   double t0; // time of first sample.
 
-  // XXX the "1" means return the latest maxout samples,
+  // the "1" argument to get() means return the latest maxout samples,
   // and discard samples older than that!
-  std::vector<double> v = sin->get(maxout, t0, 1);
 
-  assert(v.size() <= maxout);
-  for(int i = 0; i < maxout && i < v.size(); i++){
-    out[i] = v[i];
+  int n;
+  if(sin->has_iq()){
+    // return I/Q pairs.
+    std::vector<std::complex<double>> v = sin->get_iq(maxout / 2, t0, 1);
+    assert((int)v.size()*2 <= maxout);
+    for(int i = 0; i*2 < maxout && i < (int) v.size(); i++){
+      out[i*2+0] = v[i].real();
+      out[i*2+1] = v[i].imag();
+    }
+    *tm = t0 + v.size() * (1.0 / sin->rate()); // time of last sample.
+    n = v.size() * 2;
+  } else {
+    // return ordinary audio samples.
+    std::vector<double> v = sin->get(maxout, t0, 1);
+
+    assert((int) v.size() <= maxout);
+    for(int i = 0; i < maxout && i < (int) v.size(); i++){
+      out[i] = v[i];
+    }
+    *tm = t0 + v.size() / (double)sin->rate(); // time of last sample.
+    n = v.size();
   }
-  *tm = t0 + v.size() * (1.0 / sin->rate()); // time of last sample.
-  return v.size();
+
+  return n;
 }
 
 int
-ext_set_freq(void *thing, int hz)
+ext_snd_in_freq(void *thing, int hz)
 {
   SoundIn *sin = (SoundIn *) thing;
   int x = sin->set_freq(hz);
   return x;
+}
+
+//
+// open a sound card or HPSDR for output.
+//
+void *
+ext_snd_out_open(const char *card, const char *chan, int rate)
+{
+  SoundOut *sout = SoundOut::open(card, chan, rate);
+  sout->start();
+  return (void *) sout;
+}
+
+int
+ext_snd_out_freq(void *thing, int hz)
+{
+  SoundOut *sout = (SoundOut *) thing;
+  sout->set_freq(hz);
+  return hz;
+}
+
+void
+ext_snd_out_write(void *thing, double *buf, int n)
+{
+  SoundOut *sout = (SoundOut *) thing;
+  std::vector<double> v(buf, buf + n);
+  sout->write(v);
 }
